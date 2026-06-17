@@ -115,10 +115,10 @@ fn reporter() void {
         const avg = if (elapsed > 0) @as(f64, @floatFromInt(total)) / (elapsed * 1000.0) else 0;
         const sec: u64 = @intFromFloat(elapsed);
         std.debug.print("\r{d:0>3}:{d:0>2}:{d:0>2} H:{d} IB:{d} MB:{d} MBR:{d} SH:{d} Diff:{d} @ {d:.2} KH/s ({d:.2} avg)   ", .{
-            sec / 3600,                    (sec % 3600) / 60,              sec % 60,
-            G.height.load(.monotonic),     G.blocks.load(.monotonic),      G.accepted.load(.monotonic),
-            G.rejected.load(.monotonic),   G.submitted.load(.monotonic),   G.difficulty.load(.monotonic),
-            rate,                          avg,
+            sec / 3600,                  (sec % 3600) / 60,            sec % 60,
+            G.height.load(.monotonic),   G.blocks.load(.monotonic),    G.accepted.load(.monotonic),
+            G.rejected.load(.monotonic), G.submitted.load(.monotonic), G.difficulty.load(.monotonic),
+            rate,                        avg,
         });
     }
 }

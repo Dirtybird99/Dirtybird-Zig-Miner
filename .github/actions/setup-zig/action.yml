@@ -1,0 +1,29 @@
+name: Setup Zig
+description: Install a pinned Zig toolchain (no Node-based action; works on Linux/Windows/macOS runners).
+inputs:
+  version:
+    description: Zig version to install
+    required: false
+    default: "0.14.1"
+runs:
+  using: composite
+  steps:
+    - name: Install Zig ${{ inputs.version }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        VER="${{ inputs.version }}"
+        case "${{ runner.os }}" in
+          Windows) ARCH="x86_64-windows"; EXT="zip" ;;
+          Linux)   ARCH="x86_64-linux";   EXT="tar.xz" ;;
+          macOS)   ARCH="aarch64-macos";  EXT="tar.xz" ;;
+          *) echo "unsupported runner OS"; exit 1 ;;
+        esac
+        DIR="zig-${ARCH}-${VER}"
+        URL="https://ziglang.org/download/${VER}/${DIR}.${EXT}"
+        echo "Downloading $URL"
+        curl -fsSL -o "zig.${EXT}" "$URL"
+        # bsdtar (the `tar` shipped on all GitHub runners) extracts both .zip and .tar.xz
+        tar -xf "zig.${EXT}"
+        echo "${GITHUB_WORKSPACE}/${DIR}" >> "$GITHUB_PATH"
+        rm -f "zig.${EXT}"

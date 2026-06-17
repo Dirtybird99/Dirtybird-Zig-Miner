@@ -355,7 +355,7 @@ test "bucketSortSA matches naive SA on random + adversarial inputs" {
 
     // adversarial: all same byte, runs, near-periodic
     const cases = [_][]const u8{
-        "a", "aa", "aaaa", "ababab", "abcabcabc", "\x00\x00\x00", "\x00\x01\x00\x01",
+        "a",      "aa",          "aaaa",      "ababab",    "abcabcabc", "\x00\x00\x00", "\x00\x01\x00\x01",
         "banana", "mississippi", "aaaaaaaab", "baaaaaaaa",
     };
     for (cases) |t| {
@@ -395,7 +395,7 @@ test "radixSortSA8 matches naive SA on random + adversarial inputs" {
     }
 
     const cases = [_][]const u8{
-        "a", "aa", "aaaa", "ababab", "abcabcabc", "banana", "mississippi",
+        "a",                  "aa",                 "aaaa",             "ababab", "abcabcabc", "banana", "mississippi",
         "aaaaaaaaaaaaaaaaab", "baaaaaaaaaaaaaaaaa", "abababababababab",
     };
     for (cases) |t| {

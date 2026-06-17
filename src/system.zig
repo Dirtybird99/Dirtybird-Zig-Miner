@@ -272,11 +272,11 @@ pub fn recommendedAffinityForThreads(n: usize) [24]u6 {
     // Ordered preference: distinct P-core physicals, then E-cores, then HT siblings.
     const order = [24]u6{
         // 8 distinct P-core physical cores (even logicals = first HT sibling)
-        0, 2, 4, 6, 8, 10, 12, 14,
+        0,  2,  4,  6,  8,  10, 12, 14,
         // 8 E-cores (no HT)
         16, 17, 18, 19, 20, 21, 22, 23,
         // 8 P-core HT siblings (share L1/L2 with their even partner above)
-        1, 3, 5, 7, 9, 11, 13, 15,
+        1,  3,  5,  7,  9,  11, 13, 15,
     };
 
     var result = [_]u6{0} ** 24;

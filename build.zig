@@ -65,4 +65,19 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("run", "Build and run the miner");
     run_step.dependOn(&run_cmd.step);
+
+    // ---- synthetic hashrate benchmark (no network; used by the Benchmarks CI).
+    // Usage: zig build bench -- <threads> <seconds> <aff 0/1> <affmode>
+    const bench = b.addExecutable(.{
+        .name = "bench",
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addSaDeps(bench, b, pgo, profile_rt);
+    b.installArtifact(bench);
+    const bench_run = b.addRunArtifact(bench);
+    if (b.args) |args| bench_run.addArgs(args);
+    const bench_step = b.step("bench", "Run the synthetic hashrate benchmark");
+    bench_step.dependOn(&bench_run.step);
 }

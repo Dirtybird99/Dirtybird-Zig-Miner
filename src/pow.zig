@@ -72,7 +72,6 @@ pub fn computeSA(input: []const u8, w: *Worker) !void {
             sa_fast.radixSortSA8(w.sa_radix.?, w.sData[0..w.data_len].ptr, w.sa[0..w.data_len].ptr, w.data_len);
         },
     }
-
 }
 
 /// SA bytes (the message hashed in stage 7) for a worker after computeSA.

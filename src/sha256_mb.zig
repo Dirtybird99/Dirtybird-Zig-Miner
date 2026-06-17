@@ -771,8 +771,7 @@ fn compress2(st0: *State, st1: *State, base0: [*]const u8, base1: [*]const u8, n
           [k] "r" (&W),
           [mask] "r" (&SHUF_MASK),
           [sv] "r" (&save),
-        : "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8",
-          "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15", "memory", "cc"
+        : "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15", "memory", "cc"
     );
 }
 
