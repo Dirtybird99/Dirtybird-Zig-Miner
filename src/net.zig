@@ -5,14 +5,24 @@
 //!   the C's SSL_VERIFY_NONE) -> HTTP/1.1 Upgrade to WebSocket at `/ws/{wallet}`
 //!   -> receive jobs as JSON text frames, submit shares as JSON text frames.
 //!
-//! ## Windows read-timeout note (see docs/net-findings.md)
+//! ## Read-timeout note (see docs/net-findings.md)
 //! `std.net.Stream.read` uses `ReadFile`, which ignores `SO_RCVTIMEO`, and even a
 //! Winsock `recv` did not honor it on the socket Zig hands back. So this client
 //! hands `tls.Client` a `SelectStream` wrapper whose read waits for readability
-//! via `select()` (independent of `SO_RCVTIMEO`) and then `recv`s. An idle read
-//! returns `error.WouldBlock`, exactly the recoverable "no data yet" the C's
-//! 50ms `SO_RCVTIMEO` produced. This keeps the faithful single-thread design:
-//! one loop interleaves recv + share submit; teardown is `close` on that thread.
+//! (independent of `SO_RCVTIMEO`) and then `recv`s. An idle read returns
+//! `error.WouldBlock`, exactly the recoverable "no data yet" the C's 50ms
+//! `SO_RCVTIMEO` produced. This keeps the faithful single-thread design: one loop
+//! interleaves recv + share submit; teardown is `close` on that thread.
+//!
+//! ## Cross-platform raw-socket layer
+//! The TLS/WebSocket/getwork layers above are already portable; only the raw
+//! socket layer differs. It is split on `builtin.os.tag`:
+//!   - Windows: Winsock (`ws2_32`) with `select()` for read readiness. PRESERVED
+//!     byte-for-byte -- the comment above explains why `select()` (not recv's own
+//!     timeout) gates the read here.
+//!   - POSIX (Linux/Android/macOS): `std.posix` with `poll(POLLIN)` for read
+//!     readiness. The std.posix wrappers map errno into Zig error sets, which we
+//!     fold into the SAME `SockError` set so the callers above are unchanged.
 //!
 //! ## Public API
 //! ```
@@ -28,6 +38,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const tls = std.crypto.tls;
+const is_windows = builtin.os.tag == .windows;
+// Winsock declarations are comptime-available on every target, but every USE of
+// `ws2` below lives inside an `if (is_windows)` branch so the POSIX build (which
+// prunes that dead branch) never tries to resolve a Windows-only call.
 const ws2 = std.os.windows.ws2_32;
 
 // ===========================================================================
@@ -322,39 +336,64 @@ pub fn buildSubmit(out: []u8, share: Share) ![]const u8 {
 
 const SockError = error{ WouldBlock, Closed, ConnectionReset, Unexpected };
 
-/// Implements the duck-typed std.crypto.tls.Client stream interface using
-/// Winsock recv/send + select() for read readiness. On Windows only; the rest
-/// of net.zig is structured so a POSIX variant could be added if needed.
+/// Implements the duck-typed std.crypto.tls.Client stream interface using a
+/// per-OS raw socket layer (Winsock on Windows, std.posix elsewhere) with a
+/// readiness wait (`select`/`poll`) for the read timeout. The handle type is
+/// `std.posix.socket_t`, which IS `ws2.SOCKET` on Windows, so the Windows path
+/// is unchanged and `std.net.Stream.handle` plugs straight in on both.
 const SelectStream = struct {
-    handle: ws2.SOCKET,
+    handle: std.posix.socket_t,
     timeout_ms: u32,
 
     pub const ReadError = SockError;
     pub const WriteError = SockError;
 
     fn waitReadable(s: SelectStream) SockError!void {
-        var rset = ws2.fd_set{ .fd_count = 1, .fd_array = undefined };
-        rset.fd_array[0] = s.handle;
-        var tv = ws2.timeval{
-            .sec = @intCast(s.timeout_ms / 1000),
-            .usec = @intCast((s.timeout_ms % 1000) * 1000),
-        };
-        const sr = ws2.select(0, &rset, null, null, &tv); // nfds ignored on Windows
-        if (sr == 0) return error.WouldBlock;
-        if (sr == ws2.SOCKET_ERROR) return error.Unexpected;
+        if (is_windows) {
+            var rset = ws2.fd_set{ .fd_count = 1, .fd_array = undefined };
+            rset.fd_array[0] = s.handle;
+            var tv = ws2.timeval{
+                .sec = @intCast(s.timeout_ms / 1000),
+                .usec = @intCast((s.timeout_ms % 1000) * 1000),
+            };
+            const sr = ws2.select(0, &rset, null, null, &tv); // nfds ignored on Windows
+            if (sr == 0) return error.WouldBlock;
+            if (sr == ws2.SOCKET_ERROR) return error.Unexpected;
+        } else {
+            // POSIX: poll() for read readiness, mirroring the Windows select().
+            var fds = [_]std.posix.pollfd{.{ .fd = s.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(&fds, @intCast(s.timeout_ms)) catch return error.Unexpected;
+            if (ready == 0) return error.WouldBlock; // timeout -> recoverable idle tick
+            // POLLERR/HUP/NVAL surface as a dead connection on the recv() below.
+        }
     }
 
     pub fn read(s: SelectStream, buffer: []u8) ReadError!usize {
         try s.waitReadable();
-        const n = ws2.recv(s.handle, buffer.ptr, @intCast(buffer.len), 0);
-        if (n == ws2.SOCKET_ERROR) {
-            return switch (ws2.WSAGetLastError()) {
-                .WSAETIMEDOUT, .WSAEWOULDBLOCK => error.WouldBlock,
-                .WSAECONNRESET, .WSAECONNABORTED, .WSAENOTCONN, .WSAESHUTDOWN => error.ConnectionReset,
+        if (is_windows) {
+            const n = ws2.recv(s.handle, buffer.ptr, @intCast(buffer.len), 0);
+            if (n == ws2.SOCKET_ERROR) {
+                return switch (ws2.WSAGetLastError()) {
+                    .WSAETIMEDOUT, .WSAEWOULDBLOCK => error.WouldBlock,
+                    .WSAECONNRESET, .WSAECONNABORTED, .WSAENOTCONN, .WSAESHUTDOWN => error.ConnectionReset,
+                    else => error.Unexpected,
+                };
+            }
+            return @intCast(n);
+        } else {
+            // std.posix.recv maps errno into a Zig error set; fold it into the
+            // SAME SockError set the Windows path returns. EAGAIN/EWOULDBLOCK ->
+            // WouldBlock (recoverable idle), peer-gone errnos -> ConnectionReset.
+            return std.posix.recv(s.handle, buffer, 0) catch |e| switch (e) {
+                error.WouldBlock => error.WouldBlock, // EAGAIN/EWOULDBLOCK
+                error.ConnectionResetByPeer, // ECONNRESET
+                error.ConnectionTimedOut, // ETIMEDOUT
+                error.SocketNotConnected, // ENOTCONN
+                error.ConnectionRefused, // ECONNREFUSED
+                => error.ConnectionReset,
                 else => error.Unexpected,
             };
         }
-        return @intCast(n);
     }
     pub fn readv(s: SelectStream, iovecs: []std.posix.iovec) ReadError!usize {
         if (iovecs.len == 0) return 0;
@@ -372,16 +411,35 @@ const SelectStream = struct {
         return index;
     }
     pub fn write(s: SelectStream, buffer: []const u8) WriteError!usize {
-        const n = ws2.send(s.handle, buffer.ptr, @intCast(buffer.len), 0);
-        if (n == ws2.SOCKET_ERROR) {
-            return switch (ws2.WSAGetLastError()) {
-                // A send timeout (SO_SNDTIMEO) or backpressure on a wedged peer is
-                // treated as a dead connection -> reconnect, not a fatal Unexpected.
-                .WSAETIMEDOUT, .WSAEWOULDBLOCK, .WSAECONNRESET, .WSAECONNABORTED, .WSAENOTCONN, .WSAESHUTDOWN => error.ConnectionReset,
+        if (is_windows) {
+            const n = ws2.send(s.handle, buffer.ptr, @intCast(buffer.len), 0);
+            if (n == ws2.SOCKET_ERROR) {
+                return switch (ws2.WSAGetLastError()) {
+                    // A send timeout (SO_SNDTIMEO) or backpressure on a wedged peer is
+                    // treated as a dead connection -> reconnect, not a fatal Unexpected.
+                    .WSAETIMEDOUT, .WSAEWOULDBLOCK, .WSAECONNRESET, .WSAECONNABORTED, .WSAENOTCONN, .WSAESHUTDOWN => error.ConnectionReset,
+                    else => error.Unexpected,
+                };
+            }
+            return @intCast(n);
+        } else {
+            // POSIX send. MSG.NOSIGNAL suppresses SIGPIPE on a send to a closed
+            // socket (otherwise the default action kills the process); on platforms
+            // lacking it (macOS/iOS) a startup sigaction(SIGPIPE, IGN) or SO_NOSIGPIPE
+            // would be needed instead, but all current build targets are Linux/Android
+            // where MSG.NOSIGNAL exists. Mirror the Windows write semantics: a
+            // timeout/backpressure/peer-gone send is a dead connection (ConnectionReset),
+            // NOT WouldBlock -- shares/pongs are tiny and must not spuriously "retry".
+            // (std.posix.send's error set treats ENOTCONN as unreachable, so a
+            // peer-gone write surfaces as EPIPE/ECONNRESET instead -- both mapped.)
+            return std.posix.send(s.handle, buffer, std.posix.MSG.NOSIGNAL) catch |e| switch (e) {
+                error.WouldBlock, // EAGAIN/EWOULDBLOCK (send timeout / backpressure)
+                error.BrokenPipe, // EPIPE (peer closed; SIGPIPE suppressed above)
+                error.ConnectionResetByPeer, // ECONNRESET
+                => error.ConnectionReset,
                 else => error.Unexpected,
             };
         }
-        return @intCast(n);
     }
     pub fn writev(s: SelectStream, iovecs: []const std.posix.iovec_const) WriteError!usize {
         if (iovecs.len == 0) return 0;
@@ -453,8 +511,18 @@ fn connectAndUpgrade(
     }
     const target = addr orelse return error.NoIPv4Address;
 
-    // ---- TCP connect (Zig handles WSAStartup internally) ----
-    const netstream = try std.net.tcpConnectToAddress(target);
+    // ---- TCP connect ----
+    // Windows: keep std.net.tcpConnectToAddress (it handles WSAStartup internally).
+    // POSIX: socket(AF.INET, SOCK.STREAM) + connect to the resolved IPv4, then wrap
+    // the fd in a std.net.Stream so Conn/close()/stream()/setTcpNoDelay are unchanged.
+    const netstream = if (is_windows)
+        try std.net.tcpConnectToAddress(target)
+    else blk: {
+        const fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        errdefer std.posix.close(fd); // free the fd if connect fails (Conn isn't built yet)
+        try std.posix.connect(fd, &target.any, target.getOsSockLen());
+        break :blk std.net.Stream{ .handle = fd };
+    };
     var conn = Conn{ .netstream = netstream, .client = undefined, .timeout_ms = CONNECT_TIMEOUT_MS };
     errdefer conn.close();
 
@@ -516,19 +584,34 @@ fn connectAndUpgrade(
     return conn;
 }
 
-fn setTcpNoDelay(handle: ws2.SOCKET) void {
+fn setTcpNoDelay(handle: std.posix.socket_t) void {
     const on: u32 = 1;
-    // IPPROTO_TCP = 6, TCP_NODELAY = 1.
-    _ = ws2.setsockopt(handle, 6, 1, std.mem.asBytes(&on), @sizeOf(u32));
+    if (is_windows) {
+        // IPPROTO_TCP = 6, TCP_NODELAY = 1.
+        _ = ws2.setsockopt(handle, 6, 1, std.mem.asBytes(&on), @sizeOf(u32));
+    } else {
+        // Best-effort, like the Windows path (a failure here isn't fatal).
+        std.posix.setsockopt(handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&on)) catch {};
+    }
 }
 
-/// Bound a wedged send (the read side is already bounded by select()). Set once
-/// and kept for the connection's life at the generous connect timeout, NOT the
-/// 50ms mining timeout (a tiny share/pong send must not spuriously fail under
-/// transient backpressure). SOL_SOCKET=0xffff, SO_SNDTIMEO=0x1005.
-fn setSndTimeout(handle: ws2.SOCKET, ms: u32) void {
-    const val: u32 = ms;
-    _ = ws2.setsockopt(handle, 0xffff, 0x1005, std.mem.asBytes(&val), @sizeOf(u32));
+/// Bound a wedged send (the read side is already bounded by select()/poll()). Set
+/// once and kept for the connection's life at the generous connect timeout, NOT
+/// the 50ms mining timeout (a tiny share/pong send must not spuriously fail under
+/// transient backpressure).
+///
+/// Windows: SOL_SOCKET=0xffff, SO_SNDTIMEO=0x1005 (a u32 milliseconds value).
+/// POSIX: no-op. SO_SNDTIMEO there takes a `struct timeval` whose field names and
+/// `time_t` width vary across gnu/musl/android, which is needless cross-target
+/// friction for a pure backpressure guard -- and the POSIX send-side error mapping
+/// already turns a wedged/timed-out send into ConnectionReset (-> reconnect), so
+/// the guarantee the timeout existed to provide is preserved without it.
+fn setSndTimeout(handle: std.posix.socket_t, ms: u32) void {
+    if (is_windows) {
+        const val: u32 = ms;
+        _ = ws2.setsockopt(handle, 0xffff, 0x1005, std.mem.asBytes(&val), @sizeOf(u32));
+    }
+    // POSIX: intentional no-op (see doc comment).
 }
 
 /// Send a masked WebSocket frame over the TLS connection.
