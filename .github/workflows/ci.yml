@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Build and KAT (windows-x86_64)
+    # The networking layer (src/net.zig) currently targets Windows (Winsock).
+    # Linux/Android builds need the POSIX socket backend; until then CI runs on
+    # Windows, which is the platform the release binary targets.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Pin Zig 0.14.1 (the project's minimum_zig_version).
+      - name: Setup Zig 0.14.1
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.14.1
+
+      # ReleaseFast + native CPU is the canonical build. The SHA-NI inline asm is
+      # comptime-gated on the target's +sha feature, so this compiles on any
+      # x86-64 runner (with or without SHA-NI) -- the hash path simply falls back
+      # to std.crypto when the feature is absent.
+      - name: Build (ReleaseFast, native CPU)
+        run: zig build -Doptimize=ReleaseFast -Dcpu=native
+
+      # --selftest runs the pow("a") known-answer test and exits 0 on PASS / 1 on
+      # FAIL, validating the hash end-to-end (whichever SHA path the runner uses).
+      - name: Self-test (pow(a) KAT)
+        run: .\zig-out\bin\zig-miner.exe --selftest

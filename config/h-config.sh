@@ -1,0 +1,6 @@
+if [[ $CUSTOM_URL == wss* ]]; then
+    USERNAME=`echo $CUSTOM_TEMPLATE | cut -d . -f 1`
+else
+    USERNAME=$CUSTOM_TEMPLATE
+fi
+echo -e "-d $CUSTOM_URL -w $USERNAME $CUSTOM_USER_CONFIG" > $CUSTOM_CONFIG_FILENAME
