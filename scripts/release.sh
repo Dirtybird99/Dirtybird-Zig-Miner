@@ -1,177 +1,84 @@
 #!/usr/bin/env bash
 #
-# Build the optimized Dirtybird Zig Miner and package a release.
+# Dirtybird Zig Miner -- build all release binaries + packages into dist/.
 #
-# Produces a self-contained release directory and a matching .zip under dist/:
+# Usage:  scripts/release.sh [version]
+#   version defaults to the latest git tag, else v0.0.0-dev.
+#   Override the Zig binary with ZIG=/path/to/zig.
 #
-#   dist/dirtybird-zig-miner-<os>-v<version>/
-#       zig-miner[.exe]        the optimized miner
-#       README.md
-#       LICENSE
-#       THIRD-PARTY-LICENSES
-#       config/                HiveOS / launcher config (if present in the repo)
-#       script.sh              interactive launcher
-#   dist/dirtybird-zig-miner-<os>-v<version>.zip
+# Produces, for each platform, an archive containing the binary plus README,
+# LICENSE, THIRD-PARTY-LICENSES, the launcher (script.sh / start.bat), and (Linux)
+# the HiveOS config/. Plus a HiveOS/MMPOS package and a SHA256SUMS.txt.
 #
-# Unlike the reference C release.sh, there is nothing to patchelf/ldd here: the
-# Zig build links libc/libc++ through Zig's toolchain, so the binary ships as a
-# single file with no side-car .so/.dll to bundle.
-#
-# Usage:
-#   scripts/release.sh [version] [build-dir-unused] [output-dir]
-#     version     release tag, e.g. 0.1.0 or v0.1.0 (default: binary's own -v)
-#     output-dir  staging root for the package + zip (default: dist)
-#
-# Env knobs (all optional):
-#   ZIG=zig         zig binary (override to pin 0.14.1, e.g. .tools/zig/zig)
-#   CPU=native      -Dcpu= value
-#   SKIP_BUILD=0    set to 1 to package an already-built zig-out/bin binary
-#
+# x86-64 builds target an AVX2 + SHA-NI baseline (x86_64_v3+sha). They are NOT
+# PGO-optimized here (CI has no profile); for the absolute fastest binary do the
+# PGO build from source (see README) -- the hash output is identical either way.
 set -euo pipefail
+cd "$(dirname "$0")/.."
 
-# Always operate from the repo root.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-cd "$REPO_ROOT"
-
-OUTPUT_DIR="${3:-dist}"
+VER="${1:-$(git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0-dev)}"
 ZIG="${ZIG:-zig}"
-CPU="${CPU:-native}"
-SKIP_BUILD="${SKIP_BUILD:-0}"
+DIST="dist"
+NAME="Dirtybird-Zig-Miner"
+# x86-64 build flags (AVX2 + SHA-NI baseline). Opt-in PGO via PGO=1 when a local
+# profile exists (CI has none -> plain ReleaseFast; hash output is identical).
+X86="-Dcpu=x86_64_v3+sha"
+if [ "${PGO:-0}" = "1" ] && [ -f _pgo/merged.profdata ]; then X86="$X86 -Dpgo=use"; fi
 
-# --- build the optimized binary ----------------------------------------------
-# We package whatever is in zig-out/bin. If you want the headline PGO build,
-# run scripts/build-pgo.sh first and then `SKIP_BUILD=1 scripts/release.sh`.
-if [ "$SKIP_BUILD" != "1" ]; then
-    command -v "$ZIG" >/dev/null 2>&1 || {
-        echo "error: '$ZIG' not found on PATH. Install Zig 0.14.1 (or set ZIG=)." >&2
-        exit 1
-    }
-    echo "[release] building optimized binary (ReleaseFast, -Dcpu=$CPU)"
-    "$ZIG" build -Doptimize=ReleaseFast "-Dcpu=$CPU"
-fi
+rm -rf "$DIST" _build
+mkdir -p "$DIST"
 
-# Resolve the produced binary (.exe on Windows).
-if   [ -f "zig-out/bin/zig-miner.exe" ]; then BINARY_NAME="zig-miner.exe"
-elif [ -f "zig-out/bin/zig-miner"     ]; then BINARY_NAME="zig-miner"
-else
-    echo "error: zig-out/bin/zig-miner not found. Build first (or unset SKIP_BUILD)." >&2
-    exit 1
-fi
-BINARY_PATH="zig-out/bin/$BINARY_NAME"
+stage_common() { cp README.md LICENSE THIRD-PARTY-LICENSES script.sh "$1"/; }
 
-# --- resolve version ---------------------------------------------------------
-# Default to the version the binary reports (zig-miner v0.1.0); allow override.
-VERSION="${1:-}"
-if [ -z "$VERSION" ]; then
-    # The miner prints its version line via std.debug.print (stderr), so fold
-    # stderr into stdout before scraping it.
-    VERSION="$("$BINARY_PATH" -v 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
-fi
-VERSION="${VERSION#v}"
-[ -n "$VERSION" ] || { echo "error: could not determine version; pass it as the first argument." >&2; exit 1; }
-ASSET_VERSION="v$VERSION"
+PY="$(command -v python3 || command -v python)"
+zipdir() { # $1 = folder name under $DIST to zip (folder name = archive stem)
+  "$PY" - "$DIST" "$1" <<'PY'
+import sys, shutil, os
+dist, name = sys.argv[1], sys.argv[2]
+shutil.make_archive(os.path.join(dist, name), "zip", root_dir=dist, base_dir=name)
+PY
+}
 
-# OS tag for the package name (mirrors dirtybird's win64/amd64 naming).
-case "$(uname -s 2>/dev/null || echo unknown)" in
-    MINGW*|MSYS*|CYGWIN*|Windows_NT) OS_TAG="win64" ;;
-    Darwin)                          OS_TAG="macos" ;;
-    Linux)                           OS_TAG="linux-amd64" ;;
-    *)                               OS_TAG="amd64" ;;
-esac
+mk_tar() { # $1=archive-name  $2=zig-target  $3=cpu-flags
+  local name="$1" d="$DIST/$1"
+  mkdir -p "$d"
+  "$ZIG" build -Doptimize=ReleaseFast -Dtarget="$2" $3 -p "_build/$name"
+  cp "_build/$name/bin/zig-miner" "$d/zig-miner"
+  chmod +x "$d/zig-miner"
+  stage_common "$d"
+  cp -r config "$d/config"
+  tar -C "$DIST" --mode='u+rwx,go+rx' -czf "$DIST/$name.tar.gz" "$name"
+  rm -rf "$d"
+}
 
-PACKAGE_NAME="dirtybird-zig-miner-$OS_TAG-$ASSET_VERSION"
-STAGE_ROOT="$REPO_ROOT/$OUTPUT_DIR"
-PACKAGE_DIR="$STAGE_ROOT/$PACKAGE_NAME"
+# ---- Linux + macOS tarballs (static musl = runs on any Linux) ----------------
+mk_tar "${NAME}-amd64-${VER}"       x86_64-linux-musl  "$X86"
+mk_tar "${NAME}-arm64-${VER}"       aarch64-linux-musl ""
+mk_tar "${NAME}-macos-arm64-${VER}" aarch64-macos      ""
 
-echo "================================================"
-echo "Dirtybird Zig Miner -- release packaging"
-echo "  version : $ASSET_VERSION"
-echo "  binary  : $BINARY_NAME"
-echo "  package : $PACKAGE_NAME"
-echo "================================================"
+# ---- Windows zip -------------------------------------------------------------
+"$ZIG" build -Doptimize=ReleaseFast -Dtarget=x86_64-windows-gnu $X86 -p _build/win
+wd="$DIST/${NAME}-win64-${VER}"
+mkdir -p "$wd"
+cp _build/win/bin/zig-miner.exe "$wd/"
+stage_common "$wd"
+cp start.bat "$wd/"
+zipdir "${NAME}-win64-${VER}"
+rm -rf "$wd"
 
-# --- stage the package -------------------------------------------------------
-mkdir -p "$STAGE_ROOT"
-rm -rf "$PACKAGE_DIR"
-mkdir -p "$PACKAGE_DIR"
+# ---- HiveOS / MMPOS package (static amd64 binary + h-scripts) ----------------
+hd="$DIST/hive/zig-miner"
+mkdir -p "$hd"
+cp config/h-manifest.conf config/h-run.sh config/h-config.sh config/h-stats.sh README.md LICENSE "$hd/"
+"$ZIG" build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl $X86 -p _build/hive
+cp _build/hive/bin/zig-miner "$hd/zig-miner"
+chmod +x "$hd/zig-miner" "$hd"/*.sh
+tar -C "$DIST/hive" --mode='u+rwx,go+rx' -czf "$DIST/dirtybird-zig-miner-${VER}.hiveos_mmpos.amd64.tar.gz" zig-miner
+rm -rf "$DIST/hive"
 
-cp "$BINARY_PATH" "$PACKAGE_DIR/"
-chmod +x "$PACKAGE_DIR/$BINARY_NAME" 2>/dev/null || true
+# ---- checksums ---------------------------------------------------------------
+( cd "$DIST" && sha256sum *.zip *.tar.gz > SHA256SUMS.txt )
+rm -rf _build
 
-# Docs + license bundle (THIRD-PARTY-LICENSES is required by the bundled libsais
-# Apache-2.0 / v114 MIT terms).
-for doc in README.md LICENSE THIRD-PARTY-LICENSES; do
-    if [ -f "$REPO_ROOT/$doc" ]; then
-        cp "$REPO_ROOT/$doc" "$PACKAGE_DIR/"
-    else
-        echo "[release] warning: $doc not found in repo root; skipping" >&2
-    fi
-done
-
-# HiveOS / launcher config, if the repo carries one.
-if [ -d "$REPO_ROOT/config" ]; then
-    cp -r "$REPO_ROOT/config" "$PACKAGE_DIR/config"
-else
-    echo "[release] note: no config/ directory in repo; skipping" >&2
-fi
-
-# Interactive launcher.
-if [ -f "$REPO_ROOT/script.sh" ]; then
-    cp "$REPO_ROOT/script.sh" "$PACKAGE_DIR/script.sh"
-    chmod +x "$PACKAGE_DIR/script.sh" 2>/dev/null || true
-else
-    echo "[release] warning: script.sh not found in repo root; skipping" >&2
-fi
-
-# Short quick-start so the archive is usable on its own.
-cat > "$PACKAGE_DIR/QUICKSTART.txt" <<EOF
-Dirtybird Zig Miner $ASSET_VERSION
-==================================
-
-Contents:
-- $BINARY_NAME       the miner (single, self-contained binary)
-- README.md
-- LICENSE
-- THIRD-PARTY-LICENSES
-- config/            HiveOS / launcher config (if included)
-- script.sh          interactive launcher (run with: bash script.sh)
-
-Quick start:
-  ./$BINARY_NAME -d pool.example:10100 -w dero1q...your_wallet... -t 10
-or, interactively:
-  bash script.sh
-
-Replace the host/wallet with your own DERO pool and a valid checksummed
-DERO wallet address. -t defaults to your logical CPU count.
-
-Notes:
-- Requires a 64-bit CPU with SHA-NI + AVX2 for the accelerated path.
-- On startup the miner runs a pow("a") self-test; it must say PASS.
-  Run it standalone with:  ./$BINARY_NAME --selftest
-EOF
-
-# --- archive -----------------------------------------------------------------
-ARCHIVE_PATH="$STAGE_ROOT/$PACKAGE_NAME.zip"
-rm -f "$ARCHIVE_PATH"
-if command -v zip >/dev/null 2>&1; then
-    ( cd "$STAGE_ROOT" && zip -qr "$PACKAGE_NAME.zip" "$PACKAGE_NAME" )
-    echo "[release] created archive: $ARCHIVE_PATH"
-elif command -v powershell >/dev/null 2>&1; then
-    # Windows without the zip tool: fall back to PowerShell's Compress-Archive.
-    # PowerShell can't open MSYS /c/.. paths, so hand it Windows-style paths.
-    PS_DIR="$PACKAGE_DIR"; PS_ARCHIVE="$ARCHIVE_PATH"
-    if command -v cygpath >/dev/null 2>&1; then
-        PS_DIR="$(cygpath -w "$PACKAGE_DIR")"
-        PS_ARCHIVE="$(cygpath -w "$ARCHIVE_PATH")"
-    fi
-    powershell -NoProfile -Command \
-        "Compress-Archive -Path '$PS_DIR' -DestinationPath '$PS_ARCHIVE' -Force"
-    echo "[release] created archive: $ARCHIVE_PATH"
-else
-    echo "[release] note: no 'zip' or 'powershell' found; leaving the staged dir only." >&2
-fi
-
-echo "================================================"
-echo "[release] package ready: $PACKAGE_DIR"
-echo "================================================"
+echo "=== built into $DIST/ ==="
+ls -1 "$DIST"
