@@ -20,6 +20,19 @@ The multi-buffer round body is written as **pure legacy-SSE inline assembly** (t
 
 The batched final SHA is independently checked to be byte-identical to `std.crypto`'s SHA-256 for each message, so the multi-buffer path changes timing only, never output.
 
+## Downloads
+
+Prebuilt binaries are on the [Releases](https://github.com/Dirtybird99/Dirtybird-Zig-Miner/releases) page:
+
+| Platform | Asset | Notes |
+|---|---|---|
+| Windows x64 | `…-windows-x86_64.zip` | AVX2 + SHA-NI (AMD Zen / Intel Alder Lake+) |
+| Linux x64 | `…-linux-x86_64.tar.gz` | glibc; AVX2 + SHA-NI |
+| Linux x64 (static) | `…-linux-x86_64-static.tar.gz` | musl, fully static — good for HiveOS |
+| Linux ARM64 (static) | `…-linux-aarch64-static.tar.gz` | musl static; ARM Linux & Android/Termux (portable SHA — no SHA-NI accel) |
+
+Each archive bundles the binary plus `README`, `LICENSE`, `THIRD-PARTY-LICENSES`, the launcher (`script.sh` / `start.bat`), and (Linux) the HiveOS `config/`. Verify with the release's `SHA256SUMS.txt`. Or [build from source](#build).
+
 ## Algorithm (AstroBWTv3)
 
 ```
@@ -41,7 +54,10 @@ A suffix array is unique for a given string, so step 6 is byte-identical across 
 Requirements:
 
 - **Zig 0.14.1** (pinned).
-- An **x86-64 CPU with SHA-NI and AVX2** (e.g. Intel Raptor Lake / Alder Lake, or AMD Zen). The accelerated final hash requires `+sha`; the build targets `+avx2`. On a host without these features the SHA path compiles and runs but falls back to `std.crypto`.
+- **Platforms:** Windows, Linux, and Android/macOS (the socket layer is cross-platform — Winsock on Windows, `std.posix` elsewhere). TLS is `std.crypto.tls`; no OpenSSL needed.
+- **CPU:** for the accelerated final hash, an **x86-64 CPU with SHA-NI + AVX2** (AMD Zen, Intel Alder Lake+). The SHA-NI inline asm is comptime-gated on `+sha`, so on any other CPU — including ARM64 (Android, ARM Linux) — it transparently falls back to portable `std.crypto` (correct, just without the SHA-NI speedup). The ~10% edge over the reference is x86-only.
+
+Cross-compile examples: `-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v3+sha`, `-Dtarget=x86_64-linux-musl -Dcpu=x86_64_v3+sha` (static), `-Dtarget=aarch64-linux-musl` (ARM64 static). Native `aarch64-linux-android` additionally needs the Android NDK for Bionic libc.
 
 Build the miner:
 
