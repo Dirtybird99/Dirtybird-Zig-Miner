@@ -25,11 +25,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      # Pin Zig 0.14.1 (the project's minimum_zig_version).
-      - name: Setup Zig 0.14.1
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.14.1
+      # Install Zig 0.14.1 directly (the project's minimum_zig_version). Done with a
+      # plain run step rather than a setup action so CI carries no deprecated-Node
+      # action runtime. Checksum-verified against the official release.
+      - name: Install Zig 0.14.1
+        shell: pwsh
+        run: |
+          $ver = "0.14.1"
+          $url = "https://ziglang.org/download/$ver/zig-x86_64-windows-$ver.zip"
+          $sha = "554f5378228923ffd558eac35e21af020c73789d87afeabf4bfd16f2e6feed2c"
+          Invoke-WebRequest -Uri $url -OutFile zig.zip
+          $got = (Get-FileHash zig.zip -Algorithm SHA256).Hash
+          if ($got -ne $sha.ToUpper()) { throw "Zig checksum mismatch: $got" }
+          Expand-Archive -Path zig.zip -DestinationPath "$env:RUNNER_TEMP\zig" -Force
+          "$env:RUNNER_TEMP\zig\zig-x86_64-windows-$ver" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
       # ReleaseFast + native CPU is the canonical build. The SHA-NI inline asm is
       # comptime-gated on the target's +sha feature, so this compiles on any
