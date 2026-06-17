@@ -1,0 +1,59 @@
+name: Security
+
+# Note: GitHub CodeQL does not support Zig, so there is no CodeQL job here (it
+# would only cover the vendored C/C++ suffix array). The jobs below — secret
+# scanning, a committed-binary gate, and dependency review — are the meaningful
+# security checks for this repository.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secret-scan:
+    name: Secret Scanning
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  check-binaries:
+    name: Check for Binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: Fail if binary artifacts are tracked
+        run: |
+          bad=$(git ls-files | grep -iE '\.(exe|dll|so|dylib|a|obj|pdb|lib|zip|tar|gz|xz|bz2|7z|profdata|profraw)$' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::Binary/artifact files are tracked in the repo:"; echo "$bad"; exit 1
+          fi
+          echo "OK: no tracked binary artifacts."
+
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Dependency Review only runs on pull requests (it diffs the PR's manifests).
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/dependency-review-action@v4

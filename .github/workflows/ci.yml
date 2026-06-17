@@ -15,39 +15,51 @@ concurrency:
 
 jobs:
   build-test:
-    name: Build and KAT (windows-x86_64)
-    # The networking layer (src/net.zig) currently targets Windows (Winsock).
-    # Linux/Android builds need the POSIX socket backend; until then CI runs on
-    # Windows, which is the platform the release binary targets.
-    runs-on: windows-latest
+    name: Build and Test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Windows, os: windows-latest }
+          - { name: Linux, os: ubuntu-latest }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-zig
+      # ReleaseFast + native CPU. The SHA-NI asm is comptime-gated on +sha, so this
+      # compiles on any x86-64 runner and the hash falls back to std.crypto when the
+      # runner lacks SHA-NI -- the KAT validates correctness either way.
+      - name: Build (ReleaseFast, native)
+        run: zig build -Doptimize=ReleaseFast -Dcpu=native
+      - name: Self-test (pow(a) KAT)
+        shell: bash
+        run: |
+          BIN=zig-out/bin/zig-miner
+          [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+          "$BIN" --selftest
+
+  arm64-emulated:
+    name: Build and KAT (linux-aarch64, emulated)
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      # Install Zig 0.14.1 directly (the project's minimum_zig_version). Done with a
-      # plain run step rather than a setup action so CI carries no deprecated-Node
-      # action runtime. Checksum-verified against the official release.
-      - name: Install Zig 0.14.1
-        shell: pwsh
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-zig
+      # Cross-build a fully-static aarch64 musl binary and run its KAT under
+      # qemu-user (no SHA-NI on ARM -> portable std.crypto path; KAT still validates).
+      - name: Cross-build aarch64 (static) + KAT under QEMU
         run: |
-          $ver = "0.14.1"
-          $url = "https://ziglang.org/download/$ver/zig-x86_64-windows-$ver.zip"
-          $sha = "554f5378228923ffd558eac35e21af020c73789d87afeabf4bfd16f2e6feed2c"
-          Invoke-WebRequest -Uri $url -OutFile zig.zip
-          $got = (Get-FileHash zig.zip -Algorithm SHA256).Hash
-          if ($got -ne $sha.ToUpper()) { throw "Zig checksum mismatch: $got" }
-          Expand-Archive -Path zig.zip -DestinationPath "$env:RUNNER_TEMP\zig" -Force
-          "$env:RUNNER_TEMP\zig\zig-x86_64-windows-$ver" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl -p out-arm64
+          sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static
+          qemu-aarch64-static ./out-arm64/bin/zig-miner --selftest
 
-      # ReleaseFast + native CPU is the canonical build. The SHA-NI inline asm is
-      # comptime-gated on the target's +sha feature, so this compiles on any
-      # x86-64 runner (with or without SHA-NI) -- the hash path simply falls back
-      # to std.crypto when the feature is absent.
-      - name: Build (ReleaseFast, native CPU)
-        run: zig build -Doptimize=ReleaseFast -Dcpu=native
-
-      # --selftest runs the pow("a") known-answer test and exits 0 on PASS / 1 on
-      # FAIL, validating the hash end-to-end (whichever SHA path the runner uses).
-      - name: Self-test (pow(a) KAT)
-        run: .\zig-out\bin\zig-miner.exe --selftest
+  hygiene:
+    name: Repo Hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-zig
+      - name: zig fmt --check
+        run: zig fmt --check src build.zig

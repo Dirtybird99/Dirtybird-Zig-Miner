@@ -1,0 +1,50 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  synthetic-benchmark:
+    name: Synthetic Benchmark (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Windows, os: windows-latest }
+          - { name: Linux, os: ubuntu-latest }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-zig
+      # Synthetic, no-network hashrate run (2 threads, 8s). CI runners are shared
+      # and not perf-representative -- this is a smoke/throughput sanity check, not
+      # the headline number (see the README for the real measurement).
+      - name: Run synthetic benchmark
+        shell: bash
+        run: |
+          zig build bench -Doptimize=ReleaseFast -Dcpu=native -- 2 8 2>&1 | tee "bench-${{ matrix.name }}.txt"
+      - name: Job summary
+        shell: bash
+        run: |
+          {
+            echo "### Synthetic benchmark (${{ matrix.name }})"
+            echo '```'
+            grep -E "KH/s" "bench-${{ matrix.name }}.txt" || cat "bench-${{ matrix.name }}.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ matrix.name }}
+          path: bench-${{ matrix.name }}.txt
