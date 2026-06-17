@@ -1,0 +1,27 @@
+# Zig build outputs
+.zig-cache/
+zig-cache/
+zig-out/
+
+# Compiled / linker artifacts
+*.exe
+*.obj
+*.pdb
+*.o
+*.a
+*.lib
+*.s
+
+# Toolchains / large external trees (kept out of source control)
+.tools/
+
+# PGO profiles (regenerate locally; see README)
+_pgo/
+*.profraw
+*.profdata
+
+# Local logs, run output, and scratch/experiment dirs
+*.log
+*.out
+_*/
+oracle/build/

@@ -1,0 +1,13 @@
+.{
+    .name = .zig_miner,
+    .version = "0.1.0",
+    .fingerprint = 0x3cad4c91115e7dae,
+    .minimum_zig_version = "0.14.1",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "vendor",
+    },
+}

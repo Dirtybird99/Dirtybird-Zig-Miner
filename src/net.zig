@@ -1,0 +1,935 @@
+//! net.zig -- DERO "getwork" client over a TLS WebSocket (Zig 0.14.1).
+//!
+//! Port of the upstream C `network.cpp`. Transport:
+//!   TCP -> TLS handshake (std.crypto.tls.Client, verification DISABLED, mirroring
+//!   the C's SSL_VERIFY_NONE) -> HTTP/1.1 Upgrade to WebSocket at `/ws/{wallet}`
+//!   -> receive jobs as JSON text frames, submit shares as JSON text frames.
+//!
+//! ## Windows read-timeout note (see docs/net-findings.md)
+//! `std.net.Stream.read` uses `ReadFile`, which ignores `SO_RCVTIMEO`, and even a
+//! Winsock `recv` did not honor it on the socket Zig hands back. So this client
+//! hands `tls.Client` a `SelectStream` wrapper whose read waits for readability
+//! via `select()` (independent of `SO_RCVTIMEO`) and then `recv`s. An idle read
+//! returns `error.WouldBlock`, exactly the recoverable "no data yet" the C's
+//! 50ms `SO_RCVTIMEO` produced. This keeps the faithful single-thread design:
+//! one loop interleaves recv + share submit; teardown is `close` on that thread.
+//!
+//! ## Public API
+//! ```
+//! const job: Job = ...;                 // 48-byte blob + jobid + height + diff + counters
+//! const cfg = Config{ .host = ..., .port = ..., .wallet = ... };
+//! const hooks = Hooks{ .ctx = ..., .on_job = ..., .poll_share = ...,
+//!                      .set_connected = ..., .should_quit = ... };
+//! net.run(allocator, cfg, hooks);       // blocking connect+reconnect loop
+//! ```
+//! Pure, testable building blocks (used by `run`, exercised by tests):
+//!   base64Encode, wsEncodeFrame, WsFrameParser, parseJob, buildSubmit.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const tls = std.crypto.tls;
+const ws2 = std.os.windows.ws2_32;
+
+// ===========================================================================
+// Public types
+// ===========================================================================
+
+/// Size of a DERO miniblock / block-hashing blob, in bytes (96 hex chars).
+pub const BLOB_SIZE = 48;
+
+pub const Job = struct {
+    blob: [BLOB_SIZE]u8 = [_]u8{0} ** BLOB_SIZE,
+    jobid_buf: [128]u8 = undefined,
+    jobid_len: usize = 0,
+    height: i64 = 0,
+    difficulty: u64 = 0,
+    miniblocks: i64 = 0,
+    blocks: i64 = 0,
+    rejected: i64 = 0,
+
+    pub fn jobid(self: *const Job) []const u8 {
+        return self.jobid_buf[0..self.jobid_len];
+    }
+    fn setJobid(self: *Job, s: []const u8) void {
+        const n = @min(s.len, self.jobid_buf.len);
+        @memcpy(self.jobid_buf[0..n], s[0..n]);
+        self.jobid_len = n;
+    }
+};
+
+pub const Config = struct {
+    host: []const u8,
+    port: u16,
+    wallet: []const u8,
+};
+
+pub const Share = struct {
+    jobid: []const u8,
+    mbl_blob_hex: []const u8,
+};
+
+/// Caller-provided integration hooks (the miner supplies these).
+pub const Hooks = struct {
+    ctx: *anyopaque,
+    /// Called whenever a new/changed, well-formed job arrives.
+    on_job: *const fn (ctx: *anyopaque, job: *const Job) void,
+    /// Called frequently (every read timeout and after each frame). Return a
+    /// share to submit, or null. The returned slices must remain valid until the
+    /// next call to poll_share (point them at caller-owned buffers).
+    poll_share: *const fn (ctx: *anyopaque) ?Share,
+    /// Called on connect (true) and disconnect (false) so the miner can gate hashing.
+    set_connected: *const fn (ctx: *anyopaque, connected: bool) void,
+    /// Return true to stop the run loop (shutdown).
+    should_quit: *const fn (ctx: *anyopaque) bool,
+};
+
+// ===========================================================================
+// base64 (for Sec-WebSocket-Key) -- matches the C's std b64 alphabet
+// ===========================================================================
+
+const b64_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64 with padding. `out` must be at least `((data.len+2)/3)*4`.
+/// Returns the encoded slice.
+pub fn base64Encode(out: []u8, data: []const u8) []const u8 {
+    var oi: usize = 0;
+    var i: usize = 0;
+    while (i < data.len) : (i += 3) {
+        var v: u32 = @as(u32, data[i]) << 16;
+        if (i + 1 < data.len) v |= @as(u32, data[i + 1]) << 8;
+        if (i + 2 < data.len) v |= @as(u32, data[i + 2]);
+        out[oi] = b64_alphabet[(v >> 18) & 0x3f];
+        out[oi + 1] = b64_alphabet[(v >> 12) & 0x3f];
+        out[oi + 2] = if (i + 1 < data.len) b64_alphabet[(v >> 6) & 0x3f] else '=';
+        out[oi + 3] = if (i + 2 < data.len) b64_alphabet[v & 0x3f] else '=';
+        oi += 4;
+    }
+    return out[0..oi];
+}
+
+// ===========================================================================
+// WebSocket framing (RFC 6455)
+// ===========================================================================
+
+pub const Opcode = struct {
+    pub const continuation: u8 = 0x0;
+    pub const text: u8 = 0x1;
+    pub const binary: u8 = 0x2;
+    pub const close: u8 = 0x8;
+    pub const ping: u8 = 0x9;
+    pub const pong: u8 = 0xA;
+};
+
+/// Encode a client->server frame (always masked, FIN set) into `out`.
+/// `mask` is the 4 random masking bytes. Returns the encoded slice.
+/// `out` must hold at least `payload.len + 14`.
+pub fn wsEncodeFrame(out: []u8, opcode: u8, payload: []const u8, mask: [4]u8) []const u8 {
+    var hdr: usize = 0;
+    out[0] = 0x80 | (opcode & 0x0f); // FIN + opcode
+    const len = payload.len;
+    if (len < 126) {
+        out[1] = 0x80 | @as(u8, @intCast(len)); // MASK bit + 7-bit len
+        hdr = 2;
+    } else if (len < 65536) {
+        out[1] = 0x80 | 126;
+        out[2] = @intCast((len >> 8) & 0xff);
+        out[3] = @intCast(len & 0xff);
+        hdr = 4;
+    } else {
+        out[1] = 0x80 | 127;
+        const l: u64 = len;
+        var i: usize = 0;
+        while (i < 8) : (i += 1) out[2 + i] = @intCast((l >> @intCast(56 - 8 * i)) & 0xff);
+        hdr = 10;
+    }
+    @memcpy(out[hdr .. hdr + 4], &mask);
+    hdr += 4;
+    var i: usize = 0;
+    while (i < len) : (i += 1) out[hdr + i] = payload[i] ^ mask[i & 3];
+    return out[0 .. hdr + len];
+}
+
+/// Result of feeding bytes to the streaming WS frame parser.
+pub const FrameResult = union(enum) {
+    /// Need more bytes before a full frame is available.
+    incomplete,
+    /// A complete data/control frame. `payload` points into the parser buffer
+    /// and is valid until the next `next()` call.
+    frame: struct { opcode: u8, fin: bool, payload: []const u8 },
+    /// Protocol error -> caller must reconnect.
+    protocol_error,
+};
+
+/// Streaming, allocation-light WebSocket frame parser for SERVER->client frames
+/// (unmasked). Bytes are appended via `push`; `next` extracts one frame at a
+/// time. Control frames > 125 bytes and the 126/127-encoded control frames are
+/// rejected (RFC 6455 5.5). Max payload guard mirrors the C's 1 MiB cap.
+pub const WsFrameParser = struct {
+    buf: std.ArrayList(u8), // raw received bytes not yet consumed
+    payload: std.ArrayList(u8), // owned copy of the most recent frame's payload
+
+    pub fn init(allocator: std.mem.Allocator) WsFrameParser {
+        return .{
+            .buf = std.ArrayList(u8).init(allocator),
+            .payload = std.ArrayList(u8).init(allocator),
+        };
+    }
+    pub fn deinit(self: *WsFrameParser) void {
+        self.buf.deinit();
+        self.payload.deinit();
+    }
+
+    const max_payload: usize = 1024 * 1024;
+
+    /// Append received bytes to the parser buffer.
+    pub fn push(self: *WsFrameParser, bytes: []const u8) !void {
+        try self.buf.appendSlice(bytes);
+    }
+
+    /// Try to extract the next complete frame. On `.frame`, the payload slice is
+    /// owned by the parser and valid only until the next `next()` call. An
+    /// allocation failure while copying the payload surfaces as `.protocol_error`
+    /// (which the run loop treats as a reconnect).
+    pub fn next(self: *WsFrameParser) FrameResult {
+        const data = self.buf.items;
+        if (data.len < 2) return .incomplete;
+
+        const fin = (data[0] & 0x80) != 0;
+        const opcode = data[0] & 0x0f;
+        const masked = (data[1] & 0x80) != 0;
+        var plen: u64 = data[1] & 0x7f;
+        var off: usize = 2;
+
+        if (plen == 126) {
+            if (data.len < 4) return .incomplete;
+            plen = (@as(u64, data[2]) << 8) | data[3];
+            off = 4;
+        } else if (plen == 127) {
+            if (data.len < 10) return .incomplete;
+            plen = 0;
+            var i: usize = 2;
+            while (i < 10) : (i += 1) plen = (plen << 8) | data[i];
+            off = 10;
+        }
+
+        if (plen > max_payload) return .protocol_error;
+        // RFC 6455 5.5: control frames carry <=125-byte payloads, not fragmented.
+        // plen is fully decoded, so this also rejects a control frame that
+        // illegally used the 126/127 extended-length encoding.
+        if (opcode >= 0x8 and plen > 125) return .protocol_error;
+
+        // Server frames must be unmasked, but tolerate a mask field if present.
+        var mask: [4]u8 = .{ 0, 0, 0, 0 };
+        if (masked) {
+            if (data.len < off + 4) return .incomplete;
+            @memcpy(&mask, data[off .. off + 4]);
+            off += 4;
+        }
+
+        const total = off + @as(usize, @intCast(plen));
+        if (data.len < total) return .incomplete;
+
+        // Copy the payload into our owned buffer before compacting `buf` (the
+        // compaction below overwrites the front of `buf`, which can overlap the
+        // payload region when remaining > off).
+        self.payload.clearRetainingCapacity();
+        self.payload.appendSlice(data[off..total]) catch return .protocol_error;
+        if (masked) {
+            var i: usize = 0;
+            while (i < self.payload.items.len) : (i += 1) self.payload.items[i] ^= mask[i & 3];
+        }
+
+        // Consume this frame from the buffer (compact remaining bytes to front).
+        const remaining = data.len - total;
+        std.mem.copyForwards(u8, self.buf.items[0..remaining], self.buf.items[total..]);
+        self.buf.shrinkRetainingCapacity(remaining);
+
+        return .{ .frame = .{ .opcode = opcode, .fin = fin, .payload = self.payload.items } };
+    }
+};
+
+// ===========================================================================
+// JSON field extraction (tolerant scanner, matches the C's substring approach)
+// ===========================================================================
+
+/// Extract a string value for `"key":"value"` (no nested objects/escapes), like
+/// the C's json_str. Returns null on miss.
+pub fn jsonStr(json: []const u8, key: []const u8) ?[]const u8 {
+    var pat_buf: [128]u8 = undefined;
+    const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\":\"", .{key}) catch return null;
+    const start = std.mem.indexOf(u8, json, pat) orelse return null;
+    const vstart = start + pat.len;
+    const rest = json[vstart..];
+    const qend = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
+    return rest[0..qend];
+}
+
+/// Extract a bare int value for `"key":12345`, like the C's json_int.
+/// Returns 0 on miss or if the value is a string. Tolerates leading whitespace.
+pub fn jsonInt(json: []const u8, key: []const u8) i64 {
+    var pat_buf: [128]u8 = undefined;
+    const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\":", .{key}) catch return 0;
+    const start = std.mem.indexOf(u8, json, pat) orelse return 0;
+    var p = start + pat.len;
+    while (p < json.len and (json[p] == ' ' or json[p] == '\t')) p += 1;
+    if (p >= json.len or json[p] == '"') return 0; // string, not int
+    // Parse optional sign + digits.
+    var end = p;
+    if (end < json.len and (json[end] == '-' or json[end] == '+')) end += 1;
+    while (end < json.len and json[end] >= '0' and json[end] <= '9') end += 1;
+    if (end == p) return 0;
+    return std.fmt.parseInt(i64, json[p..end], 10) catch 0;
+}
+
+pub const ParseError = error{ MissingBlob, MissingJobid, BadBlobLen, BadBlobHex };
+
+/// Parse a DERO getwork job JSON into a Job. Mirrors the C's handle_job guards:
+/// blockhashing_blob and jobid required; blob must be exactly 96 hex chars
+/// (48 bytes). Optional counters/lasterror are read if present. `lasterror`, if
+/// non-empty, is returned via `out_lasterror` (a slice into `json`) for logging.
+pub fn parseJob(json: []const u8, out_lasterror: ?*?[]const u8) ParseError!Job {
+    if (out_lasterror) |slot| {
+        slot.* = if (jsonStr(json, "lasterror")) |e| (if (e.len > 0) e else null) else null;
+    }
+    const blob_hex = jsonStr(json, "blockhashing_blob") orelse return error.MissingBlob;
+    const jid = jsonStr(json, "jobid") orelse return error.MissingJobid;
+    if (jid.len == 0) return error.MissingJobid; // C's handle_job rejects empty jobid
+    if (blob_hex.len != BLOB_SIZE * 2) return error.BadBlobLen;
+
+    var job = Job{};
+    _ = std.fmt.hexToBytes(&job.blob, blob_hex) catch return error.BadBlobHex;
+    job.setJobid(jid);
+    job.height = jsonInt(json, "height");
+    // A negative / out-of-range difficulty (only reachable from a malformed or
+    // hostile daemon) sanitizes to 0 (degenerate) rather than @bitCasting into a
+    // huge u64 that would later crash the signed target math.
+    job.difficulty = std.math.cast(u64, jsonInt(json, "difficultyuint64")) orelse 0;
+    job.miniblocks = jsonInt(json, "miniblocks");
+    job.blocks = jsonInt(json, "blocks");
+    job.rejected = jsonInt(json, "rejected");
+    return job;
+}
+
+/// Build the share submission JSON `{"jobid":"<jid>","mbl_blob":"<hex>"}` into
+/// `out`. Returns the slice. Mirrors the C's submit_share snprintf.
+pub fn buildSubmit(out: []u8, share: Share) ![]const u8 {
+    return std.fmt.bufPrint(out, "{{\"jobid\":\"{s}\",\"mbl_blob\":\"{s}\"}}", .{ share.jobid, share.mbl_blob_hex });
+}
+
+// ===========================================================================
+// SelectStream: tls.Client stream wrapper with select()-based read timeout.
+// ===========================================================================
+
+const SockError = error{ WouldBlock, Closed, ConnectionReset, Unexpected };
+
+/// Implements the duck-typed std.crypto.tls.Client stream interface using
+/// Winsock recv/send + select() for read readiness. On Windows only; the rest
+/// of net.zig is structured so a POSIX variant could be added if needed.
+const SelectStream = struct {
+    handle: ws2.SOCKET,
+    timeout_ms: u32,
+
+    pub const ReadError = SockError;
+    pub const WriteError = SockError;
+
+    fn waitReadable(s: SelectStream) SockError!void {
+        var rset = ws2.fd_set{ .fd_count = 1, .fd_array = undefined };
+        rset.fd_array[0] = s.handle;
+        var tv = ws2.timeval{
+            .sec = @intCast(s.timeout_ms / 1000),
+            .usec = @intCast((s.timeout_ms % 1000) * 1000),
+        };
+        const sr = ws2.select(0, &rset, null, null, &tv); // nfds ignored on Windows
+        if (sr == 0) return error.WouldBlock;
+        if (sr == ws2.SOCKET_ERROR) return error.Unexpected;
+    }
+
+    pub fn read(s: SelectStream, buffer: []u8) ReadError!usize {
+        try s.waitReadable();
+        const n = ws2.recv(s.handle, buffer.ptr, @intCast(buffer.len), 0);
+        if (n == ws2.SOCKET_ERROR) {
+            return switch (ws2.WSAGetLastError()) {
+                .WSAETIMEDOUT, .WSAEWOULDBLOCK => error.WouldBlock,
+                .WSAECONNRESET, .WSAECONNABORTED, .WSAENOTCONN, .WSAESHUTDOWN => error.ConnectionReset,
+                else => error.Unexpected,
+            };
+        }
+        return @intCast(n);
+    }
+    pub fn readv(s: SelectStream, iovecs: []std.posix.iovec) ReadError!usize {
+        if (iovecs.len == 0) return 0;
+        const first = iovecs[0];
+        return s.read(first.base[0..first.len]);
+    }
+    pub fn readAtLeast(s: SelectStream, buffer: []u8, len: usize) ReadError!usize {
+        std.debug.assert(len <= buffer.len);
+        var index: usize = 0;
+        while (index < len) {
+            const amt = try s.read(buffer[index..]);
+            if (amt == 0) break;
+            index += amt;
+        }
+        return index;
+    }
+    pub fn write(s: SelectStream, buffer: []const u8) WriteError!usize {
+        const n = ws2.send(s.handle, buffer.ptr, @intCast(buffer.len), 0);
+        if (n == ws2.SOCKET_ERROR) {
+            return switch (ws2.WSAGetLastError()) {
+                // A send timeout (SO_SNDTIMEO) or backpressure on a wedged peer is
+                // treated as a dead connection -> reconnect, not a fatal Unexpected.
+                .WSAETIMEDOUT, .WSAEWOULDBLOCK, .WSAECONNRESET, .WSAECONNABORTED, .WSAENOTCONN, .WSAESHUTDOWN => error.ConnectionReset,
+                else => error.Unexpected,
+            };
+        }
+        return @intCast(n);
+    }
+    pub fn writev(s: SelectStream, iovecs: []const std.posix.iovec_const) WriteError!usize {
+        if (iovecs.len == 0) return 0;
+        const first = iovecs[0];
+        return s.write(first.base[0..first.len]);
+    }
+    pub fn writevAll(s: SelectStream, iovecs: []std.posix.iovec_const) WriteError!void {
+        if (iovecs.len == 0) return;
+        var i: usize = 0;
+        while (true) {
+            var amt = try s.writev(iovecs[i..]);
+            while (amt >= iovecs[i].len) {
+                amt -= iovecs[i].len;
+                i += 1;
+                if (i >= iovecs.len) return;
+            }
+            iovecs[i].base += amt;
+            iovecs[i].len -= amt;
+        }
+    }
+};
+
+// ===========================================================================
+// Connection + run loop
+// ===========================================================================
+
+const CONNECT_TIMEOUT_MS: u32 = 10000; // generous read timeout for handshake+upgrade
+const MINING_TIMEOUT_MS: u32 = 50; // 50ms read timeout once mining (matches the C)
+const MAX_STALL_POLLS: u32 = 200; // 200 * 50ms = 10s mid-frame stall bound (matches the C)
+const CONNECT_DEADLINE_MS: i64 = 20000; // wall-clock ceiling on the whole connect+upgrade phase
+const MIN_UPTIME_MS: i64 = 10000; // session must last this long to earn a fast reconnect
+const BACKOFF_START_MS: i64 = 1000;
+const BACKOFF_MAX_MS: i64 = 30000;
+
+const Conn = struct {
+    netstream: std.net.Stream, // owns the socket handle
+    client: tls.Client,
+    timeout_ms: u32,
+
+    fn stream(self: *Conn) SelectStream {
+        return .{ .handle = self.netstream.handle, .timeout_ms = self.timeout_ms };
+    }
+    fn close(self: *Conn) void {
+        // Close on the same thread that reads -- no cross-thread unblock needed.
+        self.netstream.close();
+    }
+};
+
+/// Resolve (IPv4, like the C's AF_INET), TCP connect, TLS handshake (no verify),
+/// and HTTP WebSocket upgrade. On success returns a connected Conn plus any
+/// bytes that arrived past the `\r\n\r\n` (a coalesced first frame; seed the
+/// parser with them). Caller owns the returned Conn and must `close` it.
+fn connectAndUpgrade(
+    allocator: std.mem.Allocator,
+    cfg: Config,
+    hooks: Hooks,
+    leftover_out: *std.ArrayList(u8),
+) !Conn {
+    const connect_start = std.time.milliTimestamp();
+    // ---- DNS resolve (IPv4 only) ----
+    const list = try std.net.getAddressList(allocator, cfg.host, cfg.port);
+    defer list.deinit();
+    var addr: ?std.net.Address = null;
+    for (list.addrs) |a| {
+        if (a.any.family == std.posix.AF.INET) {
+            addr = a;
+            break;
+        }
+    }
+    const target = addr orelse return error.NoIPv4Address;
+
+    // ---- TCP connect (Zig handles WSAStartup internally) ----
+    const netstream = try std.net.tcpConnectToAddress(target);
+    var conn = Conn{ .netstream = netstream, .client = undefined, .timeout_ms = CONNECT_TIMEOUT_MS };
+    errdefer conn.close();
+
+    setTcpNoDelay(netstream.handle);
+    setSndTimeout(netstream.handle, CONNECT_TIMEOUT_MS);
+
+    // ---- TLS handshake, verification disabled (mirrors SSL_VERIFY_NONE) ----
+    conn.client = try tls.Client.init(conn.stream(), .{
+        .host = .no_verification,
+        .ca = .no_verification,
+    });
+
+    // ---- HTTP upgrade ----
+    var keyraw: [16]u8 = undefined;
+    std.crypto.random.bytes(&keyraw);
+    var keyb64: [24]u8 = undefined;
+    const wskey = base64Encode(&keyb64, &keyraw);
+
+    var req_buf: [768]u8 = undefined;
+    const req = try std.fmt.bufPrint(&req_buf, "GET /ws/{s} HTTP/1.1\r\n" ++
+        "Host: {s}:{d}\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: {s}\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n\r\n", .{ cfg.wallet, cfg.host, cfg.port, wskey });
+    try conn.client.writeAll(conn.stream(), req);
+
+    // ---- Read HTTP response until \r\n\r\n; keep bytes past it. ----
+    var resp: [4096]u8 = undefined;
+    var total: usize = 0;
+    var header_end: usize = 0;
+    while (true) {
+        // Honor shutdown mid-handshake, and bound a peer that trickles bytes
+        // forever (defeating the per-read timeout) -- both guards the C has.
+        if (hooks.should_quit(hooks.ctx)) return error.Shutdown;
+        if (std.time.milliTimestamp() - connect_start >= CONNECT_DEADLINE_MS) return error.UpgradeStalled;
+        const n = conn.client.read(conn.stream(), resp[total..]) catch |e| {
+            // A timeout during upgrade is treated as a stalled handshake.
+            if (e == error.WouldBlock) return error.UpgradeStalled;
+            return e;
+        };
+        if (n == 0) return error.UpgradeClosed;
+        total += n;
+        if (std.mem.indexOf(u8, resp[0..total], "\r\n\r\n")) |idx| {
+            header_end = idx + 4;
+            break;
+        }
+        if (total >= resp.len) return error.UpgradeTooLarge;
+    }
+    // Require a "101" status (the C checks for the literal " 101 ").
+    if (std.mem.indexOf(u8, resp[0..total], " 101 ") == null) return error.UpgradeRejected;
+
+    // Seed the WS parser with any bytes that coalesced past the header (the C
+    // discards these -- a latent bug; we don't).
+    if (total > header_end) try leftover_out.appendSlice(resp[header_end..total]);
+
+    // Switch to the fast mining-loop read timeout now that we're upgraded.
+    conn.timeout_ms = MINING_TIMEOUT_MS;
+    return conn;
+}
+
+fn setTcpNoDelay(handle: ws2.SOCKET) void {
+    const on: u32 = 1;
+    // IPPROTO_TCP = 6, TCP_NODELAY = 1.
+    _ = ws2.setsockopt(handle, 6, 1, std.mem.asBytes(&on), @sizeOf(u32));
+}
+
+/// Bound a wedged send (the read side is already bounded by select()). Set once
+/// and kept for the connection's life at the generous connect timeout, NOT the
+/// 50ms mining timeout (a tiny share/pong send must not spuriously fail under
+/// transient backpressure). SOL_SOCKET=0xffff, SO_SNDTIMEO=0x1005.
+fn setSndTimeout(handle: ws2.SOCKET, ms: u32) void {
+    const val: u32 = ms;
+    _ = ws2.setsockopt(handle, 0xffff, 0x1005, std.mem.asBytes(&val), @sizeOf(u32));
+}
+
+/// Send a masked WebSocket frame over the TLS connection.
+fn sendFrame(conn: *Conn, scratch: []u8, opcode: u8, payload: []const u8) !void {
+    var mask: [4]u8 = undefined;
+    std.crypto.random.bytes(&mask);
+    const frame = wsEncodeFrame(scratch, opcode, payload, mask);
+    try conn.client.writeAll(conn.stream(), frame);
+}
+
+/// Blocking connect+reconnect run loop. Runs on a dedicated thread supplied by
+/// the miner; returns when `hooks.should_quit` returns true.
+pub fn run(allocator: std.mem.Allocator, cfg: Config, hooks: Hooks) void {
+    var backoff: i64 = BACKOFF_START_MS;
+
+    while (!hooks.should_quit(hooks.ctx)) {
+        var leftover = std.ArrayList(u8).init(allocator);
+        defer leftover.deinit();
+
+        var conn = connectAndUpgrade(allocator, cfg, hooks, &leftover) catch |err| {
+            if (err == error.Shutdown or hooks.should_quit(hooks.ctx)) break;
+            backoffSleep(hooks, backoff);
+            backoff = @min(backoff * 2, BACKOFF_MAX_MS);
+            continue;
+        };
+        // Connected. (Do NOT reset backoff yet -- only a *useful* session earns it.)
+        hooks.set_connected(hooks.ctx, true);
+
+        const useful = sessionLoop(allocator, &conn, hooks, leftover.items) catch false;
+
+        conn.close();
+        hooks.set_connected(hooks.ctx, false);
+
+        if (hooks.should_quit(hooks.ctx)) break;
+        if (useful) backoff = BACKOFF_START_MS;
+        backoffSleep(hooks, backoff);
+        backoff = @min(backoff * 2, BACKOFF_MAX_MS);
+    }
+    hooks.set_connected(hooks.ctx, false);
+}
+
+/// One connected session: interleave reading frames with submitting shares.
+/// Returns true if the session was "useful" (delivered a job or stayed up
+/// >= MIN_UPTIME_MS), which gates the fast-reconnect backoff reset. Returns an
+/// error / false on a dead connection (caller reconnects).
+fn sessionLoop(
+    allocator: std.mem.Allocator,
+    conn: *Conn,
+    hooks: Hooks,
+    seed: []const u8,
+) !bool {
+    var parser = WsFrameParser.init(allocator);
+    defer parser.deinit();
+    if (seed.len > 0) try parser.push(seed);
+
+    var send_scratch: [2048]u8 = undefined;
+    var submit_buf: [512]u8 = undefined;
+    var read_buf: [16384]u8 = undefined;
+
+    var last_job = Job{};
+    var have_last = false;
+    var got_job = false;
+    var stall_polls: u32 = 0; // consecutive idle reads while a partial frame is buffered
+    const session_start = std.time.milliTimestamp();
+
+    while (!hooks.should_quit(hooks.ctx)) {
+        // 1) Drain any complete frames already buffered (handles coalesced seed
+        //    and multiple frames in one read).
+        while (true) {
+            switch (parser.next()) {
+                .incomplete => break,
+                .protocol_error => return got_job, // reconnect
+                .frame => |f| {
+                    if (try handleFrame(conn, &send_scratch, f, &last_job, &have_last, hooks))
+                        got_job = true;
+                    if (f.opcode == Opcode.close) return got_job; // reconnect
+                },
+            }
+        }
+
+        // 2) Submit a pending share if the miner has one.
+        if (hooks.poll_share(hooks.ctx)) |share| {
+            const msg = buildSubmit(&submit_buf, share) catch "";
+            if (msg.len > 0) sendFrame(conn, &send_scratch, Opcode.text, msg) catch return got_job;
+        }
+
+        // 3) Read more bytes (blocks up to MINING_TIMEOUT_MS via select()).
+        // KNOWN RESIDUAL (low, hostile-peer-only): a peer trickling < 1 full TLS
+        // record keeps recv returning bytes, so client.read loops inside
+        // readvAtLeast without surfacing WouldBlock; the stall bound below only
+        // fires on full-record idleness. Bounded by the peer's pace; a fully
+        // silent peer still surfaces WouldBlock and is handled. Fixing fully needs
+        // a record-level read loop; deferred as disproportionate.
+        const n = conn.client.read(conn.stream(), &read_buf) catch |e| {
+            if (e == error.WouldBlock) {
+                // Idle tick. If a partial frame is buffered, a peer that sent a
+                // header then went silent (no RST/FIN) must not wedge us forever
+                // on stale work -- bound it like the C's MAX_STALL_POLLS. An empty
+                // buffer is the legitimate idle-between-jobs wait (unbounded).
+                if (parser.buf.items.len > 0) {
+                    stall_polls += 1;
+                    if (stall_polls >= MAX_STALL_POLLS) return got_job; // header arrived, body never did
+                }
+                continue;
+            }
+            return got_job; // dead connection -> reconnect
+        };
+        if (n == 0) return got_job; // clean EOF -> reconnect
+        stall_polls = 0; // made progress
+        try parser.push(read_buf[0..n]);
+    }
+
+    // Quit requested mid-session. Report usefulness for symmetry (unused on quit).
+    const uptime = std.time.milliTimestamp() - session_start;
+    return got_job or uptime >= MIN_UPTIME_MS;
+}
+
+/// Handle one parsed frame. Returns true iff a well-formed, changed job was
+/// delivered (so the session counts as useful). Replies to pings with pongs.
+fn handleFrame(
+    conn: *Conn,
+    send_scratch: []u8,
+    f: anytype,
+    last_job: *Job,
+    have_last: *bool,
+    hooks: Hooks,
+) !bool {
+    switch (f.opcode) {
+        Opcode.ping => {
+            // Echo payload back as a pong.
+            sendFrame(conn, send_scratch, Opcode.pong, f.payload) catch return error.SendFailed;
+            return false;
+        },
+        Opcode.pong => return false,
+        Opcode.close => return false, // caller handles reconnect
+        Opcode.text, Opcode.binary, Opcode.continuation => {
+            if (!f.fin) return false; // we don't reassemble fragments (the C bails too)
+            var lasterror: ?[]const u8 = null;
+            const job = parseJob(f.payload, &lasterror) catch {
+                // Malformed/error-only frame: not a useful job.
+                return false;
+            };
+            // Deliver only on change (height/jobid/diff/blob), like the C.
+            const changed = !have_last.* or
+                !std.mem.eql(u8, job.jobid(), last_job.jobid()) or
+                !std.mem.eql(u8, &job.blob, &last_job.blob) or
+                job.height != last_job.height or
+                job.difficulty != last_job.difficulty;
+            last_job.* = job;
+            have_last.* = true;
+            if (changed) hooks.on_job(hooks.ctx, last_job);
+            // Any well-formed job (changed or not) marks the session useful.
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// Sleep up to `ms`, in <=250ms slices that re-check should_quit so shutdown
+/// during a grown backoff doesn't lag the join (mirrors the C's backoff_sleep).
+fn backoffSleep(hooks: Hooks, ms: i64) void {
+    const SLICE: i64 = 250;
+    var remaining = ms;
+    while (remaining > 0 and !hooks.should_quit(hooks.ctx)) {
+        const slice = @min(remaining, SLICE);
+        std.time.sleep(@as(u64, @intCast(slice)) * std.time.ns_per_ms);
+        remaining -= slice;
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+const testing = std.testing;
+
+// Force semantic analysis of the entire networking core (run, connectAndUpgrade,
+// sessionLoop, handleFrame, SelectStream, ...). Zig is lazy: without this, those
+// pub/private decls are never analyzed in a `zig test` build because no test
+// references them, so compile errors in the socket layer would go unnoticed.
+test "compile: analyze all decls" {
+    testing.refAllDeclsRecursive(@This());
+}
+
+test "base64 encode known inputs" {
+    var out: [64]u8 = undefined;
+    try testing.expectEqualStrings("", base64Encode(&out, ""));
+    try testing.expectEqualStrings("Zg==", base64Encode(&out, "f"));
+    try testing.expectEqualStrings("Zm8=", base64Encode(&out, "fo"));
+    try testing.expectEqualStrings("Zm9v", base64Encode(&out, "foo"));
+    try testing.expectEqualStrings("Zm9vYg==", base64Encode(&out, "foob"));
+    try testing.expectEqualStrings("Zm9vYmFy", base64Encode(&out, "foobar"));
+    // 16 zero bytes -> what a Sec-WebSocket-Key would look like for all-zero key.
+    const zeros = [_]u8{0} ** 16;
+    try testing.expectEqualStrings("AAAAAAAAAAAAAAAAAAAAAA==", base64Encode(&out, &zeros));
+}
+
+test "ws frame encode (masked) short payload" {
+    var out: [64]u8 = undefined;
+    const mask = [4]u8{ 0x01, 0x02, 0x03, 0x04 };
+    const frame = wsEncodeFrame(&out, Opcode.text, "Hi", mask);
+    // FIN+text=0x81, MASK+len2=0x82, mask bytes, then 'H'^1, 'i'^2
+    try testing.expectEqual(@as(usize, 8), frame.len);
+    try testing.expectEqual(@as(u8, 0x81), frame[0]);
+    try testing.expectEqual(@as(u8, 0x82), frame[1]);
+    try testing.expectEqualSlices(u8, &mask, frame[2..6]);
+    try testing.expectEqual(@as(u8, 'H' ^ 0x01), frame[6]);
+    try testing.expectEqual(@as(u8, 'i' ^ 0x02), frame[7]);
+}
+
+// Build an UNMASKED server frame for parser round-trip tests.
+fn makeServerFrame(out: []u8, opcode: u8, payload: []const u8) []const u8 {
+    var hdr: usize = 0;
+    out[0] = 0x80 | (opcode & 0x0f);
+    const len = payload.len;
+    if (len < 126) {
+        out[1] = @intCast(len);
+        hdr = 2;
+    } else if (len < 65536) {
+        out[1] = 126;
+        out[2] = @intCast((len >> 8) & 0xff);
+        out[3] = @intCast(len & 0xff);
+        hdr = 4;
+    } else {
+        out[1] = 127;
+        const l: u64 = len;
+        var i: usize = 0;
+        while (i < 8) : (i += 1) out[2 + i] = @intCast((l >> @intCast(56 - 8 * i)) & 0xff);
+        hdr = 10;
+    }
+    @memcpy(out[hdr .. hdr + len], payload);
+    return out[0 .. hdr + len];
+}
+
+test "ws frame parser round-trip 7-bit, ping, fragmented push" {
+    var parser = WsFrameParser.init(testing.allocator);
+    defer parser.deinit();
+
+    var fbuf: [256]u8 = undefined;
+    const frame = makeServerFrame(&fbuf, Opcode.text, "hello world");
+
+    // Push in two chunks to exercise the streaming path.
+    try parser.push(frame[0..3]);
+    try testing.expect(parser.next() == .incomplete);
+    try parser.push(frame[3..]);
+    switch (parser.next()) {
+        .frame => |f| {
+            try testing.expectEqual(Opcode.text, f.opcode);
+            try testing.expect(f.fin);
+            try testing.expectEqualStrings("hello world", f.payload);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expect(parser.next() == .incomplete);
+
+    // Ping frame.
+    const ping = makeServerFrame(&fbuf, Opcode.ping, "pong-me");
+    try parser.push(ping);
+    switch (parser.next()) {
+        .frame => |f| {
+            try testing.expectEqual(Opcode.ping, f.opcode);
+            try testing.expectEqualStrings("pong-me", f.payload);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "ws frame parser 126 (u16) extended length" {
+    var parser = WsFrameParser.init(testing.allocator);
+    defer parser.deinit();
+    const payload = [_]u8{'a'} ** 200; // > 125 -> uses 126 path
+    var fbuf: [256]u8 = undefined;
+    const frame = makeServerFrame(&fbuf, Opcode.text, &payload);
+    try testing.expectEqual(@as(usize, 204), frame.len); // 4 hdr + 200
+    try parser.push(frame);
+    switch (parser.next()) {
+        .frame => |f| {
+            try testing.expectEqual(@as(usize, 200), f.payload.len);
+            try testing.expectEqualSlices(u8, &payload, f.payload);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "ws frame parser 127 (u64) extended length" {
+    var parser = WsFrameParser.init(testing.allocator);
+    defer parser.deinit();
+    const payload = [_]u8{'z'} ** 70000; // > 65535 -> uses 127 path
+    var fbuf: [70016]u8 = undefined;
+    const frame = makeServerFrame(&fbuf, Opcode.binary, &payload);
+    try testing.expectEqual(@as(usize, 10 + 70000), frame.len);
+    try parser.push(frame);
+    switch (parser.next()) {
+        .frame => |f| {
+            try testing.expectEqual(@as(usize, 70000), f.payload.len);
+            try testing.expectEqual(@as(u8, 'z'), f.payload[69999]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "ws frame parser rejects oversized control frame" {
+    var parser = WsFrameParser.init(testing.allocator);
+    defer parser.deinit();
+    // A ping (control) frame with a 126-encoded length of 200 is illegal.
+    var fbuf: [256]u8 = undefined;
+    const payload = [_]u8{0} ** 200;
+    const frame = makeServerFrame(&fbuf, Opcode.ping, &payload);
+    try parser.push(frame);
+    try testing.expect(parser.next() == .protocol_error);
+}
+
+test "ws frame parser two frames in one buffer" {
+    var parser = WsFrameParser.init(testing.allocator);
+    defer parser.deinit();
+    var b1: [64]u8 = undefined;
+    var b2: [64]u8 = undefined;
+    const f1 = makeServerFrame(&b1, Opcode.text, "first");
+    const f2 = makeServerFrame(&b2, Opcode.text, "second");
+    var combined: [128]u8 = undefined;
+    @memcpy(combined[0..f1.len], f1);
+    @memcpy(combined[f1.len .. f1.len + f2.len], f2);
+    try parser.push(combined[0 .. f1.len + f2.len]);
+
+    switch (parser.next()) {
+        .frame => |f| try testing.expectEqualStrings("first", f.payload),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (parser.next()) {
+        .frame => |f| try testing.expectEqualStrings("second", f.payload),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expect(parser.next() == .incomplete);
+}
+
+test "parseJob on realistic DERO getwork JSON" {
+    // 96 hex chars = 48 bytes.
+    const blob_hex = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30";
+    const json =
+        "{\"blocktemplate_jsonrpc\":\"2.0\"," ++
+        "\"jobid\":\"686f.0000abcd.deadbeef\"," ++
+        "\"blockhashing_blob\":\"" ++ blob_hex ++ "\"," ++
+        "\"height\":3456789,\"difficultyuint64\":123456789," ++
+        "\"miniblocks\":7,\"blocks\":2,\"rejected\":1,\"lasterror\":\"\"}";
+
+    var lasterror: ?[]const u8 = null;
+    const job = try parseJob(json, &lasterror);
+    try testing.expect(lasterror == null);
+    try testing.expectEqualStrings("686f.0000abcd.deadbeef", job.jobid());
+    try testing.expectEqual(@as(i64, 3456789), job.height);
+    try testing.expectEqual(@as(u64, 123456789), job.difficulty);
+    try testing.expectEqual(@as(i64, 7), job.miniblocks);
+    try testing.expectEqual(@as(i64, 2), job.blocks);
+    try testing.expectEqual(@as(i64, 1), job.rejected);
+    // Verify the blob decoded correctly.
+    try testing.expectEqual(@as(u8, 0x01), job.blob[0]);
+    try testing.expectEqual(@as(u8, 0x30), job.blob[47]);
+
+    // Field order independence.
+    const json2 = "{\"difficultyuint64\":999,\"height\":1,\"jobid\":\"x\",\"blockhashing_blob\":\"" ++ blob_hex ++ "\"}";
+    const job2 = try parseJob(json2, null);
+    try testing.expectEqual(@as(u64, 999), job2.difficulty);
+    try testing.expectEqualStrings("x", job2.jobid());
+}
+
+test "parseJob guards: missing fields, bad blob length, lasterror" {
+    const good_blob = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30";
+
+    // Missing blob.
+    try testing.expectError(error.MissingBlob, parseJob("{\"jobid\":\"x\"}", null));
+    // Missing jobid.
+    try testing.expectError(error.MissingJobid, parseJob("{\"blockhashing_blob\":\"" ++ good_blob ++ "\"}", null));
+    // Bad blob length (too short).
+    try testing.expectError(error.BadBlobLen, parseJob("{\"jobid\":\"x\",\"blockhashing_blob\":\"abcd\"}", null));
+
+    // lasterror surfaced.
+    var le: ?[]const u8 = null;
+    _ = parseJob("{\"lasterror\":\"daemon busy\",\"jobid\":\"x\",\"blockhashing_blob\":\"" ++ good_blob ++ "\"}", &le) catch {};
+    try testing.expect(le != null);
+    try testing.expectEqualStrings("daemon busy", le.?);
+}
+
+test "buildSubmit exact format" {
+    var out: [256]u8 = undefined;
+    const blob_hex = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff001122334455";
+    const msg = try buildSubmit(&out, .{ .jobid = "686f.cafe.0001", .mbl_blob_hex = blob_hex });
+    try testing.expectEqualStrings(
+        "{\"jobid\":\"686f.cafe.0001\",\"mbl_blob\":\"" ++ blob_hex ++ "\"}",
+        msg,
+    );
+}
+
+test "jsonInt tolerant scanning" {
+    try testing.expectEqual(@as(i64, 42), jsonInt("{\"a\":42}", "a"));
+    try testing.expectEqual(@as(i64, 42), jsonInt("{\"a\": 42 }", "a")); // leading ws
+    try testing.expectEqual(@as(i64, -5), jsonInt("{\"a\":-5}", "a"));
+    try testing.expectEqual(@as(i64, 0), jsonInt("{\"a\":\"notanint\"}", "a")); // string
+    try testing.expectEqual(@as(i64, 0), jsonInt("{\"b\":1}", "a")); // miss
+    // difficultyuint64 near u64 max round-trips through i64 bitcast.
+    const big_diff: u64 = 0xFFFFFFFFFFFFFFFF;
+    var buf: [64]u8 = undefined;
+    const j = std.fmt.bufPrint(&buf, "{{\"d\":{d}}}", .{@as(i64, @bitCast(big_diff))}) catch unreachable;
+    try testing.expectEqual(big_diff, @as(u64, @bitCast(jsonInt(j, "d"))));
+}
