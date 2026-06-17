@@ -39,6 +39,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 const tls = std.crypto.tls;
 const is_windows = builtin.os.tag == .windows;
+
+// SIGPIPE suppression for POSIX `send`: Linux has MSG.NOSIGNAL; macOS/BSD lack it
+// (it's `void` there), so on non-Linux POSIX we send with no flag and instead
+// ignore SIGPIPE process-wide at connect (see connectAndUpgrade).
+const posix_send_flags: u32 = if (builtin.os.tag == .linux) std.posix.MSG.NOSIGNAL else 0;
 // Winsock declarations are comptime-available on every target, but every USE of
 // `ws2` below lives inside an `if (is_windows)` branch so the POSIX build (which
 // prunes that dead branch) never tries to resolve a Windows-only call.
@@ -425,14 +430,13 @@ const SelectStream = struct {
         } else {
             // POSIX send. MSG.NOSIGNAL suppresses SIGPIPE on a send to a closed
             // socket (otherwise the default action kills the process); on platforms
-            // lacking it (macOS/iOS) a startup sigaction(SIGPIPE, IGN) or SO_NOSIGPIPE
-            // would be needed instead, but all current build targets are Linux/Android
-            // where MSG.NOSIGNAL exists. Mirror the Windows write semantics: a
-            // timeout/backpressure/peer-gone send is a dead connection (ConnectionReset),
-            // NOT WouldBlock -- shares/pongs are tiny and must not spuriously "retry".
-            // (std.posix.send's error set treats ENOTCONN as unreachable, so a
-            // peer-gone write surfaces as EPIPE/ECONNRESET instead -- both mapped.)
-            return std.posix.send(s.handle, buffer, std.posix.MSG.NOSIGNAL) catch |e| switch (e) {
+            // lacking it (macOS/iOS) we ignore SIGPIPE process-wide at connect and
+            // send with no flag (see `posix_send_flags`). Mirror the Windows write
+            // semantics: a timeout/backpressure/peer-gone send is a dead connection
+            // (ConnectionReset), NOT WouldBlock -- shares/pongs are tiny and must not
+            // spuriously "retry". (std.posix.send's error set treats ENOTCONN as
+            // unreachable, so a peer-gone write surfaces as EPIPE/ECONNRESET -- both mapped.)
+            return std.posix.send(s.handle, buffer, posix_send_flags) catch |e| switch (e) {
                 error.WouldBlock, // EAGAIN/EWOULDBLOCK (send timeout / backpressure)
                 error.BrokenPipe, // EPIPE (peer closed; SIGPIPE suppressed above)
                 error.ConnectionResetByPeer, // ECONNRESET
@@ -520,6 +524,13 @@ fn connectAndUpgrade(
     else blk: {
         const fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
         errdefer std.posix.close(fd); // free the fd if connect fails (Conn isn't built yet)
+        // Ignore SIGPIPE so a write to a dead peer returns EPIPE instead of killing
+        // the process. Required on macOS/BSD (no MSG.NOSIGNAL); harmless on Linux.
+        std.posix.sigaction(std.posix.SIG.PIPE, &.{
+            .handler = .{ .handler = std.posix.SIG.IGN },
+            .mask = std.posix.empty_sigset,
+            .flags = 0,
+        }, null);
         try std.posix.connect(fd, &target.any, target.getOsSockLen());
         break :blk std.net.Stream{ .handle = fd };
     };

@@ -30,6 +30,8 @@ Prebuilt binaries are on the [Releases](https://github.com/Dirtybird99/Dirtybird
 | Linux x64 | `…-linux-x86_64.tar.gz` | glibc; AVX2 + SHA-NI |
 | Linux x64 (static) | `…-linux-x86_64-static.tar.gz` | musl, fully static — good for HiveOS |
 | Linux ARM64 (static) | `…-linux-aarch64-static.tar.gz` | musl static; ARM Linux & Android/Termux (portable SHA — no SHA-NI accel) |
+| macOS (Apple Silicon) | `…-macos-arm64.tar.gz` | arm64; portable SHA (no SHA-NI accel) |
+| HiveOS / MMPOS | `…hiveos_mmpos.amd64.tar.gz` | AMD64 custom-miner package (`config/` h-scripts) |
 
 Each archive bundles the binary plus `README`, `LICENSE`, `THIRD-PARTY-LICENSES`, the launcher (`script.sh` / `start.bat`), and (Linux) the HiveOS `config/`. Verify with the release's `SHA256SUMS.txt`. Or [build from source](#build).
 
