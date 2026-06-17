@@ -8,22 +8,32 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Install Zig ${{ inputs.version }}
+    # Windows: pwsh Expand-Archive (Git Bash's GNU tar can't extract .zip).
+    - name: Install Zig (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ver = "${{ inputs.version }}"
+        $dir = "zig-x86_64-windows-$ver"
+        Invoke-WebRequest -Uri "https://ziglang.org/download/$ver/$dir.zip" -OutFile zig.zip
+        Expand-Archive -Path zig.zip -DestinationPath . -Force
+        "$pwd\$dir" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+        Remove-Item zig.zip
+
+    # Linux / macOS: curl + tar (GNU/bsd tar both handle .tar.xz).
+    - name: Install Zig (Unix)
+      if: runner.os != 'Windows'
       shell: bash
       run: |
         set -euo pipefail
         VER="${{ inputs.version }}"
         case "${{ runner.os }}" in
-          Windows) ARCH="x86_64-windows"; EXT="zip" ;;
-          Linux)   ARCH="x86_64-linux";   EXT="tar.xz" ;;
-          macOS)   ARCH="aarch64-macos";  EXT="tar.xz" ;;
+          Linux) ARCH="x86_64-linux" ;;
+          macOS) ARCH="aarch64-macos" ;;
           *) echo "unsupported runner OS"; exit 1 ;;
         esac
         DIR="zig-${ARCH}-${VER}"
-        URL="https://ziglang.org/download/${VER}/${DIR}.${EXT}"
-        echo "Downloading $URL"
-        curl -fsSL -o "zig.${EXT}" "$URL"
-        # bsdtar (the `tar` shipped on all GitHub runners) extracts both .zip and .tar.xz
-        tar -xf "zig.${EXT}"
+        curl -fsSL -o zig.tar.xz "https://ziglang.org/download/${VER}/${DIR}.tar.xz"
+        tar -xf zig.tar.xz
         echo "${GITHUB_WORKSPACE}/${DIR}" >> "$GITHUB_PATH"
-        rm -f "zig.${EXT}"
+        rm -f zig.tar.xz
