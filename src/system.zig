@@ -247,6 +247,26 @@ pub fn setThreadHighPriority() void {
     );
 }
 
+// ── 4b. enableVirtualTerminal ─────────────────────────────────────────────────
+const STD_OUTPUT_HANDLE: DWORD = 0xFFFFFFF5; // (DWORD)-11
+const STD_ERROR_HANDLE: DWORD = 0xFFFFFFF4; // (DWORD)-12
+const ENABLE_VIRTUAL_TERMINAL_PROCESSING: DWORD = 0x0004;
+extern "kernel32" fn GetStdHandle(nStdHandle: DWORD) callconv(.winapi) HANDLE;
+extern "kernel32" fn GetConsoleMode(hConsoleHandle: HANDLE, lpMode: *DWORD) callconv(.winapi) BOOL;
+extern "kernel32" fn SetConsoleMode(hConsoleHandle: HANDLE, dwMode: DWORD) callconv(.winapi) BOOL;
+
+/// Enable ANSI escape (virtual terminal) processing on stdout+stderr so the colored
+/// status line renders on Windows 10+/Windows Terminal. Failure-silent (a redirected
+/// or legacy console simply keeps its mode; the reporter's TTY check skips color there).
+pub fn enableVirtualTerminal() void {
+    for ([_]DWORD{ STD_OUTPUT_HANDLE, STD_ERROR_HANDLE }) |which| {
+        const h = GetStdHandle(which);
+        var mode: DWORD = 0;
+        if (GetConsoleMode(h, &mode) == FALSE) continue;
+        _ = SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    }
+}
+
 // ── 5. recommendedAffinityForThreads ─────────────────────────────────────────
 /// Return an ordered list of logical CPU IDs for n mining threads.
 ///

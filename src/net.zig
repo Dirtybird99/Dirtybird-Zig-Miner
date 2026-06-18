@@ -98,6 +98,8 @@ pub const Hooks = struct {
     poll_share: *const fn (ctx: *anyopaque) ?Share,
     /// Called on connect (true) and disconnect (false) so the miner can gate hashing.
     set_connected: *const fn (ctx: *anyopaque, connected: bool) void,
+    /// Periodic kernel TCP RTT sample in microseconds (>= 0) for the status line's `net:`.
+    set_net_rtt: *const fn (ctx: *anyopaque, rtt_us: i64) void,
     /// Return true to stop the run loop (shutdown).
     should_quit: *const fn (ctx: *anyopaque) bool,
 };
@@ -505,6 +507,71 @@ const Conn = struct {
     }
 };
 
+// ── net: kernel TCP RTT sampling (read-only; no extra traffic; mirrors the C miner) ──
+const NET_SAMPLE_MS: i64 = 2000; // resample the socket RTT at most this often
+
+// Windows: SIO_TCP_INFO == _WSAIORW(IOC_VENDOR, 39); v0 result struct (Win10 1703+ ABI).
+const SIO_TCP_INFO: u32 = 0xD8000027;
+const TCP_INFO_v0 = extern struct {
+    State: u32,
+    Mss: u32,
+    ConnectionTimeMs: u64,
+    TimestampsEnabled: u8,
+    RttUs: u32,
+    MinRttUs: u32,
+    BytesInFlight: u32,
+    Cwnd: u32,
+    SndWnd: u32,
+    RcvWnd: u32,
+    RcvBuf: u32,
+    BytesOut: u64,
+    BytesIn: u64,
+    BytesReordered: u32,
+    BytesRetrans: u32,
+    FastRetrans: u32,
+    DupAcksIn: u32,
+    TimeoutEpisodes: u32,
+    SynRetrans: u8,
+};
+extern "ws2_32" fn WSAIoctl(
+    s: ws2.SOCKET,
+    dwIoControlCode: u32,
+    lpvInBuffer: ?*const anyopaque,
+    cbInBuffer: u32,
+    lpvOutBuffer: ?*anyopaque,
+    cbOutBuffer: u32,
+    lpcbBytesReturned: *u32,
+    lpOverlapped: ?*anyopaque,
+    lpCompletionRoutine: ?*anyopaque,
+) callconv(.winapi) i32;
+// POSIX getsockopt via libc (linked); referenced only in the Linux branch below.
+extern "c" fn getsockopt(sockfd: c_int, level: c_int, optname: c_int, optval: ?*anyopaque, optlen: *u32) c_int;
+
+/// Kernel's smoothed TCP RTT for the live socket, in microseconds, or -1 if unavailable.
+/// Read-only (WSAIoctl / getsockopt) -- no extra traffic. Mirrors C `sample_net_rtt_us`.
+fn sampleNetRttUs(handle: std.posix.socket_t) i64 {
+    if (is_windows) {
+        var info: TCP_INFO_v0 = undefined;
+        var ver: u32 = 0;
+        var bytes: u32 = 0;
+        const rc = WSAIoctl(handle, SIO_TCP_INFO, @ptrCast(&ver), @sizeOf(u32), @ptrCast(&info), @sizeOf(TCP_INFO_v0), &bytes, null, null);
+        if (rc == 0 and bytes >= @sizeOf(TCP_INFO_v0)) return @intCast(info.RttUs);
+        return -1;
+    } else if (builtin.os.tag == .linux) {
+        // struct tcp_info: tcpi_rtt (u32 microseconds) is at the stable offset
+        // 8 (u8 prefix) + 15*4 = 68.
+        const IPPROTO_TCP: c_int = 6;
+        const TCP_INFO: c_int = 11;
+        var buf = [_]u8{0} ** 256;
+        var len: u32 = buf.len;
+        if (getsockopt(@intCast(handle), IPPROTO_TCP, TCP_INFO, @ptrCast(&buf), &len) != 0) return -1;
+        if (len < 72) return -1;
+        return @intCast(std.mem.readInt(u32, buf[68..72], builtin.cpu.arch.endian()));
+    } else {
+        return -1; // macOS/other -> net:--
+    }
+}
+
 /// Resolve (IPv4, like the C's AF_INET), TCP connect, TLS handshake (no verify),
 /// and HTTP WebSocket upgrade. On success returns a connected Conn plus any
 /// bytes that arrived past the `\r\n\r\n` (a coalesced first frame; seed the
@@ -701,8 +768,17 @@ fn sessionLoop(
     var stall_polls: u32 = 0; // consecutive idle reads while a partial frame is buffered
     const session_start = std.time.milliTimestamp();
     var last_progress_ms = session_start; // last time inbound bytes arrived (dead-link watchdog)
+    var last_rtt_ms: i64 = 0; // last net-RTT sample (0 = sample on the first iteration)
 
     while (!hooks.should_quit(hooks.ctx)) {
+        // 0) Refresh the live net RTT for the status line (read-only; throttled to NET_SAMPLE_MS).
+        const rtt_now = std.time.milliTimestamp();
+        if (rtt_now - last_rtt_ms >= NET_SAMPLE_MS) {
+            last_rtt_ms = rtt_now;
+            const us = sampleNetRttUs(conn.netstream.handle);
+            if (us >= 0) hooks.set_net_rtt(hooks.ctx, us);
+        }
+
         // 1) Drain any complete frames already buffered (handles coalesced seed
         //    and multiple frames in one read).
         while (true) {

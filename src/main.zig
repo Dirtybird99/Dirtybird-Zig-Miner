@@ -8,7 +8,7 @@ const net = @import("net.zig");
 const system = @import("system.zig");
 const config = @import("config.zig");
 
-const VERSION = "0.1.1";
+const VERSION = "0.1.2";
 
 var G: state.MinerState = .{};
 
@@ -40,6 +40,12 @@ fn pollShare(ctx_ptr: *anyopaque) ?net.Share {
 fn setConnected(ctx_ptr: *anyopaque, connected: bool) void {
     const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr));
     ctx.s.connected.store(connected, .monotonic);
+    if (!connected) ctx.s.net_rtt_us.store(-1, .monotonic); // clear net: while disconnected
+}
+
+fn setNetRtt(ctx_ptr: *anyopaque, rtt_us: i64) void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr));
+    ctx.s.net_rtt_us.store(rtt_us, .monotonic);
 }
 
 fn shouldQuit(ctx_ptr: *anyopaque) bool {
@@ -100,10 +106,40 @@ fn selftest(alloc: std.mem.Allocator) !u8 {
 
 var g_verbose = false;
 
+// ANSI SGR colors matching the C miner (dirtybird-miner src/main.cpp). VT is enabled on
+// Windows; the reporter emits these only when stderr is a TTY (plain text when piped).
+const A_RESET = "\x1b[0m";
+const A_CLREOL = "\x1b[K";
+const A_BYELLOW = "\x1b[93m";
+const A_BGREEN = "\x1b[92m";
+const A_BWHITE = "\x1b[97m";
+const A_GREEN = "\x1b[32m";
+const A_BLUE = "\x1b[34m";
+const A_CYAN = "\x1b[36m";
+const A_MAGENTA = "\x1b[35m";
+const A_WHITE = "\x1b[37m";
+const A_BRED = "\x1b[91m";
+
+/// Humanize difficulty to K/M/G via integer division (matches the C reporter).
+fn fmtDiff(buf: []u8, d: u64) []const u8 {
+    if (d >= 1_000_000_000) return std.fmt.bufPrint(buf, "{d}G", .{d / 1_000_000_000}) catch "?";
+    if (d >= 1_000_000) return std.fmt.bufPrint(buf, "{d}M", .{d / 1_000_000}) catch "?";
+    if (d >= 1_000) return std.fmt.bufPrint(buf, "{d}K", .{d / 1_000}) catch "?";
+    return std.fmt.bufPrint(buf, "{d}", .{d}) catch "?";
+}
+
+/// Format net RTT (microseconds; -1 = unavailable) as the C does: --, <1ms, or Nms.
+fn fmtNet(buf: []u8, us: i64) []const u8 {
+    if (us < 0) return "--";
+    if (us < 1000) return "<1ms";
+    return std.fmt.bufPrint(buf, "{d}ms", .{@divTrunc(us, 1000)}) catch "?";
+}
+
 fn reporter() void {
     var prev: i64 = 0;
     const t0 = std.time.milliTimestamp();
     var prev_t = t0;
+    const tty = std.io.getStdErr().isTty();
     while (!G.quit.load(.monotonic)) {
         std.time.sleep(std.time.ns_per_s);
         const now = std.time.milliTimestamp();
@@ -116,12 +152,40 @@ fn reporter() void {
         const rate = if (dt > 0) @as(f64, @floatFromInt(delta)) / (dt * 1000.0) else 0;
         const avg = if (elapsed > 0) @as(f64, @floatFromInt(total)) / (elapsed * 1000.0) else 0;
         const sec: u64 = @intFromFloat(elapsed);
-        std.debug.print("\r{d:0>3}:{d:0>2}:{d:0>2} H:{d} IB:{d} MB:{d} MBR:{d} SH:{d} Diff:{d} @ {d:.2} KH/s ({d:.2} avg)   ", .{
-            sec / 3600,                  (sec % 3600) / 60,            sec % 60,
-            G.height.load(.monotonic),   G.blocks.load(.monotonic),    G.accepted.load(.monotonic),
-            G.rejected.load(.monotonic), G.submitted.load(.monotonic), G.difficulty.load(.monotonic),
-            rate,                        avg,
-        });
+        const hh = sec / 3600;
+        const mm = (sec % 3600) / 60;
+        const ss = sec % 60;
+
+        const height = G.height.load(.monotonic);
+        const accepted = G.accepted.load(.monotonic);
+        const blocks = G.blocks.load(.monotonic);
+        const rejected = G.rejected.load(.monotonic);
+        var dbuf: [24]u8 = undefined;
+        const diff = fmtDiff(&dbuf, G.difficulty.load(.monotonic));
+        var nbuf: [16]u8 = undefined;
+        const netstr = fmtNet(&nbuf, G.net_rtt_us.load(.monotonic));
+
+        if (tty) {
+            const rejcol = if (rejected > 0) A_BRED else A_WHITE;
+            std.debug.print("\r{s}[DIRTYBIRD] {s}{d:.2} KH/s{s} ({s}{d:.2} KH/s avg{s}) | {s}Height:{d}{s} | {s}Miniblocks:{d}{s} | {s}Blocks:{d}{s} | {s}REJ:{d}{s} | {s}Diff:{s}{s} | {s}net:{s}{s} | {s}{d:0>2}:{d:0>2}:{d:0>2}{s}{s}      ", .{
+                A_BYELLOW, A_BGREEN, rate,     A_BWHITE, A_GREEN,  avg,       A_BWHITE,
+                A_BLUE,    height,   A_BWHITE, A_CYAN,   accepted, A_BWHITE,  A_GREEN,
+                blocks,    A_BWHITE, rejcol,   rejected, A_BWHITE, A_MAGENTA, diff,
+                A_BWHITE,  A_CYAN,   netstr,   A_BWHITE, A_WHITE,  hh,        mm,
+                ss,        A_RESET,  A_CLREOL,
+            });
+        } else {
+            std.debug.print("[DIRTYBIRD] {d:.2} KH/s ({d:.2} KH/s avg) | Height:{d} | Miniblocks:{d} | Blocks:{d} | REJ:{d} | Diff:{s} | net:{s} | {d:0>2}:{d:0>2}:{d:0>2}\n", .{
+                rate, avg, height, accepted, blocks, rejected, diff, netstr, hh, mm, ss,
+            });
+        }
+
+        if (g_verbose) {
+            std.debug.print("\n[funnel] submitted:{d} acc:{d} rej:{d} stale:{d} sendfail:{d}\n", .{
+                G.submitted.load(.monotonic),   accepted,                        rejected,
+                G.stale_drops.load(.monotonic), G.submit_drops.load(.monotonic),
+            });
+        }
     }
 }
 
@@ -238,6 +302,7 @@ pub fn main() !u8 {
     if (builtin.os.tag == .windows) {
         _ = system.enableLockMemoryPrivilege();
         system.setProcessHighPriority();
+        system.enableVirtualTerminal(); // ANSI colors for the status line
     }
 
     // Mining-thread workers: TWO per thread (one per lane of the batched, 2-way
@@ -264,6 +329,7 @@ pub fn main() !u8 {
         .on_job = onJob,
         .poll_share = pollShare,
         .set_connected = setConnected,
+        .set_net_rtt = setNetRtt,
         .should_quit = shouldQuit,
     };
     const cfg = net.Config{ .host = G.host, .port = G.port, .wallet = G.wallet };
