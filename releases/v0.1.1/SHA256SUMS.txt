@@ -1,0 +1,5 @@
+f733853b5ade429cc7df5ef635d7bf8d6abc7f2acc137849aa3600772ddcc8c4  Dirtybird-Zig-Miner-win64-v0.1.1.zip
+580288c9df456a54e55c918a9cb003a289d24a59b1dcb68d99d237df46e4c616  Dirtybird-Zig-Miner-amd64-v0.1.1.tar.gz
+8a8d8c9b70179c2f3481d728f94fbda7aeb1e96f138dc788de4d7fdef8b0e349  Dirtybird-Zig-Miner-arm64-v0.1.1.tar.gz
+3b8f46325767463aba78e521f5ac97acc2c386cfea91adc2442c390f8e73f9f8  Dirtybird-Zig-Miner-macos-arm64-v0.1.1.tar.gz
+532ee33ff56301212f6356776504f26a0e7a85c268f83caf31081eeb5ca7bb69  dirtybird-zig-miner-v0.1.1.hiveos_mmpos.amd64.tar.gz
