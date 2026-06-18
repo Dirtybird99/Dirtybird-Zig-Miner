@@ -42,11 +42,16 @@ jobs:
       - uses: actions/checkout@v5
       - name: Fail if binary artifacts are tracked
         run: |
-          bad=$(git ls-files | grep -iE '\.(exe|dll|so|dylib|a|obj|pdb|lib|zip|tar|gz|xz|bz2|7z|profdata|profraw)$' || true)
+          # Intentionally-tracked binaries are exempt: the DeroLuna-style in-repo
+          # release archives under releases/, and the committed PGO profile (which
+          # makes release builds PGO-optimized + reproducible).
+          bad=$(git ls-files \
+            | grep -iE '\.(exe|dll|so|dylib|a|obj|pdb|lib|zip|tar|gz|xz|bz2|7z|profdata|profraw)$' \
+            | grep -vE '^releases/|^_pgo/merged\.profdata$' || true)
           if [ -n "$bad" ]; then
             echo "::error::Binary/artifact files are tracked in the repo:"; echo "$bad"; exit 1
           fi
-          echo "OK: no tracked binary artifacts."
+          echo "OK: no tracked binary artifacts (releases/ and the PGO profile are exempt)."
 
   dependency-review:
     name: Dependency Review
