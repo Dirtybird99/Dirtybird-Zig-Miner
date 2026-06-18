@@ -15,13 +15,21 @@ zig-out/
 # Toolchains / large external trees (kept out of source control)
 .tools/
 
-# PGO profiles (regenerate locally; see README)
-_pgo/
+# PGO raw profiles (regenerate locally). The merged profile is re-included further down
+# so CI/release builds are PGO-optimized + reproducible.
 *.profraw
-*.profdata
 
 # Local logs, run output, and scratch/experiment dirs
 *.log
 *.out
 _*/
 oracle/build/
+
+# ...but re-include just the merged PGO profile (the _*/ rule above excludes _pgo/).
+!_pgo/
+_pgo/*
+!_pgo/merged.profdata
+
+# release.sh build staging (the published copies live in releases/<version>/ + on the
+# GitHub Release page; releases/ itself stays tracked). _build/ is covered by _*/ above.
+dist/

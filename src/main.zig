@@ -6,8 +6,9 @@ const miner = @import("miner.zig");
 const state = @import("state.zig");
 const net = @import("net.zig");
 const system = @import("system.zig");
+const config = @import("config.zig");
 
-const VERSION = "0.1.0";
+const VERSION = "0.1.1";
 
 var G: state.MinerState = .{};
 
@@ -70,10 +71,11 @@ fn installSignalHandler() void {
 
 fn usage() void {
     std.debug.print(
-        \\Usage: zig-miner [-d host:port] [-w wallet] [-t threads] [-V] [--selftest]
-        \\  -d  daemon address host:port   (default dero.rabidmining.com:10300)
-        \\  -w  DERO wallet address        (required to mine)
-        \\  -t  mining threads             (default: logical CPU count)
+        \\Usage: zig-miner [-d host:port] [-w wallet] [-t threads] [-c config.json] [-V] [--selftest]
+        \\  -d  daemon/pool address host:port  (default community-pools.mysrv.cloud:10300)
+        \\  -w  DERO wallet address            (default from config.json / built-in)
+        \\  -t  mining threads                 (default: logical CPU count)
+        \\  -c, --config-file <path>           config file (default: config.json)
         \\  -V  verbose
         \\  --selftest  run pow("a") KAT and exit (0=PASS,1=FAIL)
         \\  -h, --help / -v, --version
@@ -123,6 +125,35 @@ fn reporter() void {
     }
 }
 
+/// Split "host:port" into G.host/G.port (port optional; keeps the current port on parse
+/// failure). Shared by the -d flag and the config.json daemon-address.
+fn setDaemon(hp: []const u8) void {
+    if (std.mem.lastIndexOfScalar(u8, hp, ':')) |c| {
+        G.host = hp[0..c];
+        G.port = std.fmt.parseInt(u16, hp[c + 1 ..], 10) catch G.port;
+    } else G.host = hp;
+}
+
+/// Load config.json (DeroLuna-compatible keys) if present and apply its daemon/wallet/
+/// threads as defaults. CLI flags (parsed afterwards) override these; a missing or
+/// invalid file is non-fatal (we fall through to the compiled-in defaults).
+fn loadConfig(alloc: std.mem.Allocator, path: []const u8, nthreads: *usize) void {
+    const file = std.fs.cwd().openFile(path, .{}) catch return;
+    defer file.close();
+    const bytes = file.readToEndAlloc(alloc, 64 * 1024) catch return;
+    defer alloc.free(bytes);
+    const c = config.parseConfig(alloc, bytes) catch |e| {
+        std.debug.print("warning: could not parse {s}: {s}\n", .{ path, @errorName(e) });
+        return;
+    };
+    if (c.daemon_address) |hp| setDaemon(hp);
+    if (c.wallet) |w| G.wallet = w;
+    if (c.threads) |t| {
+        if (t > 0) nthreads.* = @intCast(t);
+    }
+    std.debug.print("config : loaded {s}\n", .{path});
+}
+
 pub fn main() !u8 {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -133,16 +164,27 @@ pub fn main() !u8 {
 
     var do_selftest = false;
     var nthreads: usize = 0;
+
+    // Load config.json (or -c/--config-file <path>) first; CLI flags below override it.
+    {
+        var cfg_path: []const u8 = "config.json";
+        var j: usize = 1;
+        while (j < args.len) : (j += 1) {
+            if ((std.mem.eql(u8, args[j], "-c") or std.mem.eql(u8, args[j], "--config-file")) and j + 1 < args.len) {
+                cfg_path = args[j + 1];
+            }
+        }
+        loadConfig(alloc, cfg_path, &nthreads);
+    }
+
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "-d") and i + 1 < args.len) {
             i += 1;
-            const hp = args[i];
-            if (std.mem.lastIndexOfScalar(u8, hp, ':')) |c| {
-                G.host = hp[0..c];
-                G.port = std.fmt.parseInt(u16, hp[c + 1 ..], 10) catch G.port;
-            } else G.host = hp;
+            setDaemon(args[i]);
+        } else if ((std.mem.eql(u8, a, "-c") or std.mem.eql(u8, a, "--config-file")) and i + 1 < args.len) {
+            i += 1; // already applied in the config-loading block above
         } else if (std.mem.eql(u8, a, "-w") and i + 1 < args.len) {
             i += 1;
             G.wallet = args[i];

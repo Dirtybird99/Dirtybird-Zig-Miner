@@ -1,28 +1,31 @@
 @echo off
-REM Dirtybird Zig Miner -- interactive launcher (Windows).
-REM Prompts for your daemon/pool address and DERO wallet, then starts mining.
-REM Double-click it, or run it from a release folder next to zig-miner.exe.
+REM Dirtybird Zig Miner -- launcher (Windows).
+REM Presets (pool + wallet + threads) live in config.json next to zig-miner.exe.
+REM Edit config.json once with YOUR wallet, then double-click this. At each prompt,
+REM press Enter to keep the config.json value, or type a value to override it.
 setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
 set "BIN=zig-miner.exe"
 if not exist "%BIN%" if exist "zig-out\bin\zig-miner.exe" set "BIN=zig-out\bin\zig-miner.exe"
 if not exist "%BIN%" (
-    echo error: zig-miner.exe not found. Build it first ^(build.bat^) or run this from a release folder.
+    echo error: zig-miner.exe not found. Run this from a release folder ^(next to zig-miner.exe^).
     pause
     exit /b 1
 )
 
-set /p DAEMON=Daemon/pool address (host:port):
-set /p WALLET=DERO wallet address:
-set /p THREADS=Threads [10]:
-if "%THREADS%"=="" set "THREADS=10"
+echo Presets come from config.json (edit it to set your own wallet). Press Enter to use them.
+set /p DAEMON=Daemon/pool host:port [Enter=config.json]:
+set /p WALLET=DERO wallet           [Enter=config.json]:
+set /p THREADS=Threads              [Enter=config.json]:
 
-if "%DAEMON%"=="" ( echo error: a daemon address is required. & pause & exit /b 1 )
-if "%WALLET%"=="" ( echo error: a wallet is required. & pause & exit /b 1 )
+set "ARGS="
+if not "%DAEMON%"==""  set "ARGS=!ARGS! -d %DAEMON%"
+if not "%WALLET%"==""  set "ARGS=!ARGS! -w %WALLET%"
+if not "%THREADS%"=="" set "ARGS=!ARGS! -t %THREADS%"
 
 echo.
-echo Starting: %BIN% -d %DAEMON% -w %WALLET% -t %THREADS%
+echo Starting: %BIN% !ARGS!
 echo (Ctrl-C to stop)
 echo.
-"%BIN%" -d "%DAEMON%" -w "%WALLET%" -t "%THREADS%"
+"%BIN%" !ARGS!

@@ -22,17 +22,23 @@ The batched final SHA is independently checked to be byte-identical to `std.cryp
 
 ## Downloads
 
-Prebuilt binaries are on the [Releases](https://github.com/Dirtybird99/Dirtybird-Zig-Miner/releases) page:
+Prebuilt binaries are on the [Releases](https://github.com/Dirtybird99/Dirtybird-Zig-Miner/releases) page, and are also browsable in-tree under [`releases/`](https://github.com/Dirtybird99/Dirtybird-Zig-Miner/tree/main/releases). Latest: **v0.1.1**.
 
-| Platform | Asset | Notes |
+| Platform | Download | Notes |
 |---|---|---|
-| Windows x64 | `…-win64-….zip` | AVX2 + SHA-NI (AMD Zen / Intel Alder Lake+) |
-| Linux amd64 | `…-amd64-….tar.gz` | static musl — runs on any Linux; AVX2 + SHA-NI |
-| Linux arm64 | `…-arm64-….tar.gz` | static musl; ARM Linux & Android/Termux (portable SHA — no SHA-NI accel) |
-| macOS (Apple Silicon) | `…-macos-arm64-….tar.gz` | arm64; portable SHA (no SHA-NI accel) |
-| HiveOS / MMPOS | `dirtybird-zig-miner-….hiveos_mmpos.amd64.tar.gz` | amd64 custom-miner package (`config/` h-scripts) |
+| Windows x64 | [win64 .zip](https://github.com/Dirtybird99/Dirtybird-Zig-Miner/releases/download/v0.1.1/Dirtybird-Zig-Miner-win64-v0.1.1.zip) | AVX2 + SHA-NI (AMD Zen / Intel Alder Lake+) |
+| Linux amd64 | [amd64 .tar.gz](https://github.com/Dirtybird99/Dirtybird-Zig-Miner/releases/download/v0.1.1/Dirtybird-Zig-Miner-amd64-v0.1.1.tar.gz) | static musl — runs on any Linux; AVX2 + SHA-NI |
+| Linux arm64 | [arm64 .tar.gz](https://github.com/Dirtybird99/Dirtybird-Zig-Miner/releases/download/v0.1.1/Dirtybird-Zig-Miner-arm64-v0.1.1.tar.gz) | static musl; ARM Linux & Android/Termux (portable SHA — no SHA-NI accel) |
+| macOS (Apple Silicon) | [macos-arm64 .tar.gz](https://github.com/Dirtybird99/Dirtybird-Zig-Miner/releases/download/v0.1.1/Dirtybird-Zig-Miner-macos-arm64-v0.1.1.tar.gz) | arm64; portable SHA (no SHA-NI accel) |
+| HiveOS / MMPOS | [hiveos_mmpos.amd64 .tar.gz](https://github.com/Dirtybird99/Dirtybird-Zig-Miner/releases/download/v0.1.1/dirtybird-zig-miner-v0.1.1.hiveos_mmpos.amd64.tar.gz) | amd64 custom-miner package (`config/` h-scripts) |
 
-Each archive bundles the binary plus `README`, `LICENSE`, `THIRD-PARTY-LICENSES`, the launcher (`script.sh` / `start.bat`), and (Linux) the HiveOS `config/`. Verify with the release's `SHA256SUMS.txt`. Or [build from source](#build).
+**HiveOS / MMPOS** — paste this into the flight sheet's *Installation URL*:
+
+```
+https://github.com/Dirtybird99/Dirtybird-Zig-Miner/releases/download/v0.1.1/dirtybird-zig-miner-v0.1.1.hiveos_mmpos.amd64.tar.gz
+```
+
+Each archive bundles the binary, a ready-to-edit **`config.json`** (pool + wallet presets), `README`, `LICENSE`, `THIRD-PARTY-LICENSES`, the launcher (`script.sh` / `start.bat`), and (Linux) the HiveOS `config/`. Verify with the release's `SHA256SUMS.txt`. Or [build from source](#build).
 
 ## Algorithm (AstroBWTv3)
 
@@ -81,21 +87,28 @@ zig build -Doptimize=ReleaseFast -Dcpu=native -Dpgo=use
 
 ## Quick start
 
-The included **`script.sh`** is an interactive launcher: it builds the miner if needed, prompts you for your daemon/pool address and DERO wallet, then starts mining.
+Every archive ships a **`config.json`** next to the binary, pre-filled with a community pool and a default wallet — so it mines out of the box. To mine to **your** wallet, edit one line:
 
-```sh
-./script.sh
+```json
+{
+  "daemon-address": "community-pools.mysrv.cloud:10300",
+  "wallet": "dero1q...your_wallet...",
+  "threads": -1
+}
 ```
 
-```
-Daemon/pool address (host:port): pool.example:10100
-DERO wallet address: dero1q...your_wallet...
-Threads [10]: 10
-```
+Then start it:
 
-On Windows, run it from Git Bash (`bash script.sh`). It is a thin wrapper around the flags documented below.
+- **Windows:** double-click **`start.bat`** (or run `zig-miner.exe`).
+- **Linux / macOS:** `./zig-miner` (or `./script.sh`).
+
+`threads: -1` auto-detects the CPU count. The launchers also let you type a daemon/wallet/threads to override `config.json` for one run (press Enter to keep the config value), or you can pass flags directly — see [Usage](#usage).
+
+> Heads-up: if you don't set your own `wallet`, you mine to the bundled default wallet. Edit `config.json` (or pass `-w`).
 
 ## Usage
+
+Configure via `config.json` **or** flags. Precedence: **flags > `config.json` > built-in defaults**.
 
 ```sh
 zig-miner -d pool.example:10100 -w dero1q...your_wallet... -t 10
@@ -105,9 +118,10 @@ zig-miner -d pool.example:10100 -w dero1q...your_wallet... -t 10
 
 | Flag | Meaning |
 |------|---------|
-| `-d host:port` | Daemon/pool address. The miner connects over TLS-WebSocket to `wss://host/ws/{wallet}` (DERO getwork). |
-| `-w <dero-wallet>` | Your DERO wallet address. **Required to mine.** Must be a valid checksummed address — pools reject malformed addresses at the upgrade. |
-| `-t <threads>` | Number of mining threads. Defaults to the logical CPU count. |
+| `-d host:port` | Daemon/pool address. The miner connects over TLS-WebSocket to `wss://host/ws/{wallet}` (DERO getwork). Default: `community-pools.mysrv.cloud:10300`. |
+| `-w <dero-wallet>` | Your DERO wallet address (a valid checksummed address — pools reject malformed ones at the upgrade). Defaults to `config.json`, then the built-in default wallet. |
+| `-t <threads>` | Number of mining threads. Defaults to `config.json`, then the logical CPU count (`-1`/`0` = auto). |
+| `-c, --config-file <path>` | Path to the JSON config (default: `config.json` in the working directory). Keys: `daemon-address`, `wallet`, `threads` (DeroLuna-compatible). |
 | `-V` | Verbose output. |
 | `--selftest` | Run the `pow("a")` known-answer test and exit (`0` = PASS, `1` = FAIL). Mines nothing. |
 | `-h`, `--help` | Print usage and exit. |

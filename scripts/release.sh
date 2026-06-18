@@ -22,13 +22,15 @@ DIST="dist"
 NAME="Dirtybird-Zig-Miner"
 # x86-64 build flags (AVX2 + SHA-NI baseline). Opt-in PGO via PGO=1 when a local
 # profile exists (CI has none -> plain ReleaseFast; hash output is identical).
-X86="-Dcpu=x86_64_v3+sha"
-if [ "${PGO:-0}" = "1" ] && [ -f _pgo/merged.profdata ]; then X86="$X86 -Dpgo=use"; fi
+# Pin -Dpgo explicitly (off by default) so release artifacts are deterministic and do
+# not pick up the source build's "use-when-profile-present" default.
+X86="-Dcpu=x86_64_v3+sha -Dpgo=off"
+if [ "${PGO:-0}" = "1" ] && [ -f _pgo/merged.profdata ]; then X86="-Dcpu=x86_64_v3+sha -Dpgo=use"; fi
 
 rm -rf "$DIST" _build
 mkdir -p "$DIST"
 
-stage_common() { cp README.md LICENSE THIRD-PARTY-LICENSES script.sh "$1"/; }
+stage_common() { cp README.md LICENSE THIRD-PARTY-LICENSES script.sh config.json "$1"/; }
 
 PY="$(command -v python3 || command -v python)"
 zipdir() { # $1 = folder name under $DIST to zip (folder name = archive stem)
@@ -79,6 +81,14 @@ rm -rf "$DIST/hive"
 # ---- checksums ---------------------------------------------------------------
 ( cd "$DIST" && sha256sum *.zip *.tar.gz > SHA256SUMS.txt )
 rm -rf _build
+
+# ---- mirror archives into the repo tree (browsable releases/<version>/) -------
+# DeroLuna-style: the same archives that go on the Release page also live in-tree.
+# (git add releases/<version> && commit to publish them.)
+REL="releases/$VER"
+mkdir -p "$REL"
+cp "$DIST"/*.zip "$DIST"/*.tar.gz "$DIST/SHA256SUMS.txt" "$REL"/
+echo "mirrored archives into $REL/"
 
 echo "=== built into $DIST/ ==="
 ls -1 "$DIST"
