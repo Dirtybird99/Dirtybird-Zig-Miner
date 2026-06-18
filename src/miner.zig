@@ -49,11 +49,12 @@ pub fn mineThread(s: *MinerState, tid: usize, w0: *pow.Worker, w1: *pow.Worker) 
     var jbuf: [state.MAX_JOBID]u8 = undefined;
     var local_hashes: i64 = 0;
 
-    // wait for first valid job
+    // Wait until connected with a job. Mine as soon as a job arrives (like tnn) --
+    // do NOT gate on difficulty>0: the daemon validates submits, and difficulty==0
+    // yields an accept-all target rather than reject-all.
     while (!s.quit.load(.monotonic)) {
         if (s.connected.load(.monotonic) and
-            s.job_epoch.load(.acquire) > 0 and
-            s.difficulty.load(.monotonic) > 0) break;
+            s.job_epoch.load(.acquire) > 0) break;
         std.time.sleep(50 * std.time.ns_per_ms);
     }
 
@@ -69,6 +70,12 @@ pub fn mineThread(s: *MinerState, tid: usize, w0: *pow.Worker, w1: *pow.Worker) 
 
         while (true) {
             if (s.quit.load(.monotonic)) break :outer;
+            // Stop hashing the instant the connection drops (port of tnn
+            // mine_dero.cpp:198 `if (!isConnected) break;`): while disconnected we can
+            // neither submit a hit nor get fresh jobs, so the current template is
+            // doomed -- bail to the outer gate, which re-waits for `connected` and
+            // resumes on the fresh job after reconnect.
+            if (!s.connected.load(.monotonic)) break;
             if ((nonce & 127) == 0 and s.job_epoch.load(.acquire) != epoch) break;
 
             writeNonce(&blob0, nonce +% 1);

@@ -4,11 +4,16 @@ const std = @import("std");
 
 pub fn computeTarget(difficulty: u64, target: *[32]u8) void {
     @memset(target, 0);
-    // Degenerate/invalid difficulty: an all-zero target accepts no hash. This is
-    // strictly safer than the C's all-0xFF ("everything passes") behavior — a
-    // garbage daemon value can neither crash us (no signed cast) nor make us flood
-    // the pool with bogus shares.
-    if (difficulty == 0) return;
+    // Degenerate/invalid difficulty: accept every hash (all-0xFF), matching the
+    // reference C (deroTargetFromDiff). The local target is only a *submit filter* --
+    // the daemon does the real block validation -- so accept-all never misses a real
+    // block, whereas a reject-all (all-zero) target would guarantee zero finds while
+    // the difficulty is unset. In practice the daemon ships difficulty with every
+    // getwork job, so difficulty==0 is a transient that the miner gate normally skips.
+    if (difficulty == 0) {
+        @memset(target, 0xFF);
+        return;
+    }
     // 2^256 as a 33-byte big-endian number: [1, 0, 0, ..., 0]
     var dividend = [_]u8{0} ** 33;
     dividend[0] = 1;
@@ -45,8 +50,13 @@ test "computeTarget known values" {
     try std.testing.expectEqual(@as(u8, 0x80), t[0]);
     for (t[1..]) |b| try std.testing.expectEqual(@as(u8, 0), b);
 
-    computeTarget(0, &t); // degenerate -> all zero (nothing passes; safe)
-    for (t) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    computeTarget(0, &t); // degenerate -> all 0xFF (accept-all, matches the C)
+    for (t) |b| try std.testing.expectEqual(@as(u8, 0xFF), b);
+    // an all-0xFF target accepts any hash, including the maximum
+    var maxhash = [_]u8{0xFF} ** 32;
+    try std.testing.expect(checkHash(&maxhash, &t));
+    var some = [_]u8{0x7F} ** 32;
+    try std.testing.expect(checkHash(&some, &t));
 
     // Adversarial near-u64-max difficulty must not panic and yields a tiny target.
     computeTarget(std.math.maxInt(u64), &t);

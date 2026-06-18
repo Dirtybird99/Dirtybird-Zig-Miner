@@ -475,6 +475,19 @@ const MINING_TIMEOUT_MS: u32 = 50; // 50ms read timeout once mining (matches the
 const MAX_STALL_POLLS: u32 = 200; // 200 * 50ms = 10s mid-frame stall bound (matches the C)
 const CONNECT_DEADLINE_MS: i64 = 20000; // wall-clock ceiling on the whole connect+upgrade phase
 const MIN_UPTIME_MS: i64 = 10000; // session must last this long to earn a fast reconnect
+const JOB_INACTIVITY_MS: i64 = 60000; // reconnect if no inbound bytes arrive for this long (the C's 60s read timeout)
+
+/// True when a link has been silent past the inactivity threshold. Pure -> unit-testable.
+fn shouldReconnect(now_ms: i64, last_progress_ms: i64, threshold_ms: i64) bool {
+    return now_ms - last_progress_ms >= threshold_ms;
+}
+
+test "shouldReconnect inactivity predicate" {
+    try std.testing.expect(!shouldReconnect(1000, 1000, 60000)); // no time elapsed
+    try std.testing.expect(!shouldReconnect(60999, 1000, 60000)); // 59.999s < 60s
+    try std.testing.expect(shouldReconnect(61000, 1000, 60000)); // exactly 60s -> reconnect
+    try std.testing.expect(shouldReconnect(200000, 1000, 60000)); // well past
+}
 const BACKOFF_START_MS: i64 = 1000;
 const BACKOFF_MAX_MS: i64 = 30000;
 
@@ -687,6 +700,7 @@ fn sessionLoop(
     var got_job = false;
     var stall_polls: u32 = 0; // consecutive idle reads while a partial frame is buffered
     const session_start = std.time.milliTimestamp();
+    var last_progress_ms = session_start; // last time inbound bytes arrived (dead-link watchdog)
 
     while (!hooks.should_quit(hooks.ctx)) {
         // 1) Drain any complete frames already buffered (handles coalesced seed
@@ -703,8 +717,10 @@ fn sessionLoop(
             }
         }
 
-        // 2) Submit a pending share if the miner has one.
-        if (hooks.poll_share(hooks.ctx)) |share| {
+        // 2) Submit any pending shares -- drain the submit ring so a backlog of
+        //    concurrent hits all leave in one pass (each share's slices stay valid
+        //    until the next poll_share, and we consume each before the next call).
+        while (hooks.poll_share(hooks.ctx)) |share| {
             const msg = buildSubmit(&submit_buf, share) catch "";
             if (msg.len > 0) sendFrame(conn, &send_scratch, Opcode.text, msg) catch return got_job;
         }
@@ -718,10 +734,16 @@ fn sessionLoop(
         // a record-level read loop; deferred as disproportionate.
         const n = conn.client.read(conn.stream(), &read_buf) catch |e| {
             if (e == error.WouldBlock) {
-                // Idle tick. If a partial frame is buffered, a peer that sent a
-                // header then went silent (no RST/FIN) must not wedge us forever
-                // on stale work -- bound it like the C's MAX_STALL_POLLS. An empty
-                // buffer is the legitimate idle-between-jobs wait (unbounded).
+                // Dead-link watchdog: a silently-dropped TCP (no FIN/RST) returns
+                // WouldBlock forever. If no inbound bytes (job OR ping) have arrived
+                // for JOB_INACTIVITY_MS, treat the link as dead and reconnect. This
+                // also bounds the empty-buffer between-jobs idle, which otherwise
+                // `continue`s unbounded. (Matches the C's 60s inbound read timeout.)
+                if (shouldReconnect(std.time.milliTimestamp(), last_progress_ms, JOB_INACTIVITY_MS))
+                    return got_job;
+                // Partial frame buffered but the body never came: a peer that sent a
+                // header then went silent must not wedge us on stale work -- bound it
+                // like the C's MAX_STALL_POLLS.
                 if (parser.buf.items.len > 0) {
                     stall_polls += 1;
                     if (stall_polls >= MAX_STALL_POLLS) return got_job; // header arrived, body never did
@@ -732,6 +754,7 @@ fn sessionLoop(
         };
         if (n == 0) return got_job; // clean EOF -> reconnect
         stall_polls = 0; // made progress
+        last_progress_ms = std.time.milliTimestamp(); // bytes arrived -> link is alive
         try parser.push(read_buf[0..n]);
     }
 
