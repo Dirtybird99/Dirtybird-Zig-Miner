@@ -8,7 +8,7 @@ const net = @import("net.zig");
 const system = @import("system.zig");
 const config = @import("config.zig");
 
-const VERSION = "0.1.2";
+const VERSION = "0.1.3";
 
 var G: state.MinerState = .{};
 
@@ -84,6 +84,7 @@ fn usage() void {
         \\  -c, --config-file <path>           config file (default: config.json)
         \\  -V  verbose
         \\  --selftest  run pow("a") KAT and exit (0=PASS,1=FAIL)
+        \\  --setup     interactively write config.json (pool/wallet/threads), then exit
         \\  -h, --help / -v, --version
         \\
     , .{});
@@ -198,24 +199,45 @@ fn setDaemon(hp: []const u8) void {
     } else G.host = hp;
 }
 
-/// Load config.json (DeroLuna-compatible keys) if present and apply its daemon/wallet/
-/// threads as defaults. CLI flags (parsed afterwards) override these; a missing or
-/// invalid file is non-fatal (we fall through to the compiled-in defaults).
-fn loadConfig(alloc: std.mem.Allocator, path: []const u8, nthreads: *usize) void {
-    const file = std.fs.cwd().openFile(path, .{}) catch return;
+/// Absolute path to config.json next to the running executable, or null if unresolved.
+fn exeConfigPath(alloc: std.mem.Allocator) ?[]u8 {
+    const dir = std.fs.selfExeDirPathAlloc(alloc) catch return null;
+    defer alloc.free(dir);
+    return std.fs.path.join(alloc, &.{ dir, "config.json" }) catch null;
+}
+
+/// Read one trimmed line from stdin; null on empty/EOF (caller keeps the current value).
+fn promptLine(buf: []u8) ?[]const u8 {
+    const line = std.io.getStdIn().reader().readUntilDelimiterOrEof(buf, '\n') catch return null;
+    const l = line orelse return null;
+    const t = std.mem.trim(u8, l, " \t\r\n");
+    return if (t.len == 0) null else t;
+}
+
+/// Load config `path` (absolute or cwd-relative) and apply daemon/wallet/threads as
+/// defaults; CLI flags parsed afterwards override these. Returns true if the file was
+/// read+parsed. `cfg_threads` receives the raw threads value (for --setup's display).
+/// A missing/invalid file is non-fatal (returns false).
+fn loadConfig(alloc: std.mem.Allocator, path: []const u8, nthreads: *usize, cfg_threads: *i64) bool {
+    const file = (if (std.fs.path.isAbsolute(path))
+        std.fs.openFileAbsolute(path, .{})
+    else
+        std.fs.cwd().openFile(path, .{})) catch return false;
     defer file.close();
-    const bytes = file.readToEndAlloc(alloc, 64 * 1024) catch return;
+    const bytes = file.readToEndAlloc(alloc, 64 * 1024) catch return false;
     defer alloc.free(bytes);
     const c = config.parseConfig(alloc, bytes) catch |e| {
         std.debug.print("warning: could not parse {s}: {s}\n", .{ path, @errorName(e) });
-        return;
+        return false;
     };
     if (c.daemon_address) |hp| setDaemon(hp);
     if (c.wallet) |w| G.wallet = w;
     if (c.threads) |t| {
+        cfg_threads.* = t;
         if (t > 0) nthreads.* = @intCast(t);
     }
     std.debug.print("config : loaded {s}\n", .{path});
+    return true;
 }
 
 pub fn main() !u8 {
@@ -227,18 +249,35 @@ pub fn main() !u8 {
     defer std.process.argsFree(alloc, args);
 
     var do_selftest = false;
+    var do_setup = false;
     var nthreads: usize = 0;
+    var cfg_threads: i64 = -1; // raw config threads value (for --setup's "current" display)
 
-    // Load config.json (or -c/--config-file <path>) first; CLI flags below override it.
+    // -c/--config-file override, scanned up-front (also consumed in the loop below).
+    var explicit_cfg: ?[]const u8 = null;
     {
-        var cfg_path: []const u8 = "config.json";
         var j: usize = 1;
         while (j < args.len) : (j += 1) {
             if ((std.mem.eql(u8, args[j], "-c") or std.mem.eql(u8, args[j], "--config-file")) and j + 1 < args.len) {
-                cfg_path = args[j + 1];
+                explicit_cfg = args[j + 1];
             }
         }
-        loadConfig(alloc, cfg_path, &nthreads);
+    }
+
+    // Load config.json: explicit -c, else next to the executable, else the working dir.
+    // CLI flags below override it; a missing file is reported (no silent fallback).
+    {
+        var loaded = false;
+        if (explicit_cfg) |p| {
+            loaded = loadConfig(alloc, p, &nthreads, &cfg_threads);
+        } else {
+            if (exeConfigPath(alloc)) |ep| {
+                defer alloc.free(ep);
+                loaded = loadConfig(alloc, ep, &nthreads, &cfg_threads);
+            }
+            if (!loaded) loaded = loadConfig(alloc, "config.json", &nthreads, &cfg_threads);
+        }
+        if (!loaded) std.debug.print("config : no config.json found (next to the exe or in the working dir) -- using built-in defaults\n", .{});
     }
 
     var i: usize = 1;
@@ -259,6 +298,8 @@ pub fn main() !u8 {
             g_verbose = true;
         } else if (std.mem.eql(u8, a, "--selftest")) {
             do_selftest = true;
+        } else if (std.mem.eql(u8, a, "--setup")) {
+            do_setup = true;
         } else if (std.mem.eql(u8, a, "-p") or std.mem.eql(u8, a, "--priority")) {
             i += 1; // accepted for CLI compatibility; not yet used
         } else if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
@@ -271,6 +312,44 @@ pub fn main() !u8 {
             usage();
             return 1;
         }
+    }
+
+    // Interactive editor: writes config.json next to the exe (the same file the binary
+    // reads), so start.bat and a hand-edited config.json are the one persistent knob.
+    if (do_setup) {
+        var dbuf: [128]u8 = undefined;
+        const cur_daemon = std.fmt.bufPrint(&dbuf, "{s}:{d}", .{ G.host, G.port }) catch "community-pools.mysrv.cloud:10300";
+        var in_d: [256]u8 = undefined;
+        var in_w: [256]u8 = undefined;
+        var in_t: [64]u8 = undefined;
+        std.debug.print("Setup -- press Enter to keep the current value.\n", .{});
+        std.debug.print("  Daemon/pool host:port [{s}]: ", .{cur_daemon});
+        const daemon = promptLine(&in_d) orelse cur_daemon;
+        std.debug.print("  DERO wallet [{s}]: ", .{G.wallet});
+        const wallet = promptLine(&in_w) orelse G.wallet;
+        std.debug.print("  Threads (-1 = auto) [{d}]: ", .{cfg_threads});
+        const threads: i64 = if (promptLine(&in_t)) |s| (std.fmt.parseInt(i64, s, 10) catch cfg_threads) else cfg_threads;
+
+        var wpath_owned: ?[]u8 = null;
+        defer if (wpath_owned) |p| alloc.free(p);
+        const wpath: []const u8 = if (explicit_cfg) |p| p else blk: {
+            wpath_owned = exeConfigPath(alloc);
+            break :blk (wpath_owned orelse "config.json");
+        };
+        const f = (if (std.fs.path.isAbsolute(wpath))
+            std.fs.createFileAbsolute(wpath, .{})
+        else
+            std.fs.cwd().createFile(wpath, .{})) catch |e| {
+            std.debug.print("error: could not write {s}: {s}\n", .{ wpath, @errorName(e) });
+            return 1;
+        };
+        defer f.close();
+        config.writeConfig(f.writer(), daemon, wallet, threads) catch |e| {
+            std.debug.print("error: writing config: {s}\n", .{@errorName(e)});
+            return 1;
+        };
+        std.debug.print("saved {s}\n", .{wpath});
+        return 0;
     }
 
     if (do_selftest) return selftest(alloc);

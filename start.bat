@@ -1,9 +1,9 @@
 @echo off
 REM Dirtybird Zig Miner -- launcher (Windows).
-REM Presets (pool + wallet + threads) live in config.json next to zig-miner.exe.
-REM Edit config.json once with YOUR wallet, then double-click this. At each prompt,
-REM press Enter to keep the config.json value, or type a value to override it.
-setlocal EnableDelayedExpansion
+REM Your settings live in config.json next to this file. You can edit config.json
+REM directly, OR answer "y" below to set pool/wallet/threads interactively -- either way
+REM persists to the same config.json that the miner reads. Double-click to run.
+setlocal
 cd /d "%~dp0"
 
 set "BIN=zig-miner.exe"
@@ -14,18 +14,10 @@ if not exist "%BIN%" (
     exit /b 1
 )
 
-echo Presets come from config.json (edit it to set your own wallet). Press Enter to use them.
-set /p DAEMON=Daemon/pool host:port [Enter=config.json]:
-set /p WALLET=DERO wallet           [Enter=config.json]:
-set /p THREADS=Threads              [Enter=config.json]:
-
-set "ARGS="
-if not "%DAEMON%"==""  set "ARGS=!ARGS! -d %DAEMON%"
-if not "%WALLET%"==""  set "ARGS=!ARGS! -w %WALLET%"
-if not "%THREADS%"=="" set "ARGS=!ARGS! -t %THREADS%"
+set /p EDIT=Change pool/wallet/threads? (y/N):
+if /i "%EDIT%"=="y" "%BIN%" --setup
 
 echo.
-echo Starting: %BIN% !ARGS!
-echo (Ctrl-C to stop)
+echo Starting miner (Ctrl-C to stop)...
 echo.
-"%BIN%" !ARGS!
+"%BIN%"

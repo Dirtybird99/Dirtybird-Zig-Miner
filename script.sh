@@ -2,11 +2,9 @@
 #
 # Dirtybird Zig Miner -- launcher.
 #
-# Presets (pool + wallet + threads) live in config.json next to the miner. The fastest
-# way to use this: edit config.json once with YOUR wallet, then just run the binary.
-# This script is a convenience: press Enter at a prompt to keep the config.json value,
-# or type a value to override it for this run. On Windows, run from Git Bash:
-#   bash script.sh
+# Your settings live in config.json next to the binary. Edit config.json directly, OR
+# answer "y" below to set pool/wallet/threads interactively -- either way persists to the
+# same config.json the miner reads. On Windows, run from Git Bash:  bash script.sh
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -25,19 +23,11 @@ else
     fi
 fi
 
-# --- optional overrides (Enter = use config.json / built-in defaults) ----------------
-echo "Presets come from config.json (edit it to set your own wallet). Press Enter to use them."
-read -rp "Daemon/pool host:port [Enter=config.json]: " DAEMON
-read -rp "DERO wallet           [Enter=config.json]: " WALLET
-read -rp "Threads               [Enter=config.json]: " THREADS
-
-ARGS=()
-[ -n "${DAEMON:-}" ]  && ARGS+=(-d "$DAEMON")
-[ -n "${WALLET:-}" ]  && ARGS+=(-w "$WALLET")
-[ -n "${THREADS:-}" ] && ARGS+=(-t "$THREADS")
+# --- optional interactive edit (persists to config.json), then mine ------------------
+read -rp "Change pool/wallet/threads? (y/N): " EDIT
+case "${EDIT:-}" in [yY]*) "$BIN" --setup ;; esac
 
 echo
-echo "Starting: ${BIN} ${ARGS[*]:-(config.json defaults)}"
-echo "(Ctrl-C to stop)"
+echo "Starting miner (Ctrl-C to stop)..."
 echo
-exec "$BIN" "${ARGS[@]}"
+exec "$BIN"
