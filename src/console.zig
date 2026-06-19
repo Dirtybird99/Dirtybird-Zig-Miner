@@ -31,6 +31,25 @@ const SYSTEMTIME = extern struct {
 };
 extern "kernel32" fn GetLocalTime(lpSystemTime: *SYSTEMTIME) callconv(.winapi) void;
 
+// POSIX `struct tm` (LP64 glibc/musl ABI: 9 ints + the gmtoff/zone extensions) and
+// localtime_r. Hand-declared because Zig 0.14's std.c exposes neither `tm` nor `localtime_r`.
+// Referenced only in the POSIX branch, so the Windows build prunes them (and never links
+// libc's localtime_r). time_t is `long` (= c_long, 64-bit) on the x86_64/aarch64 targets.
+const CTm = extern struct {
+    tm_sec: c_int,
+    tm_min: c_int,
+    tm_hour: c_int,
+    tm_mday: c_int,
+    tm_mon: c_int,
+    tm_year: c_int,
+    tm_wday: c_int,
+    tm_yday: c_int,
+    tm_isdst: c_int,
+    tm_gmtoff: c_long,
+    tm_zone: ?[*:0]const u8,
+};
+extern "c" fn localtime_r(timer: *const c_long, result: *CTm) ?*CTm;
+
 fn nowLocal() LocalTime {
     if (is_windows) {
         var st: SYSTEMTIME = undefined;
@@ -47,9 +66,9 @@ fn nowLocal() LocalTime {
         // POSIX: localtime_r for the broken-down local fields, milliTimestamp for ms.
         // libC is linked (build.zig: linkLibC). This branch is pruned on Windows.
         const ms_total = std.time.milliTimestamp();
-        const t: std.c.time_t = @intCast(@divFloor(ms_total, 1000));
-        var tm: std.c.tm = undefined;
-        _ = std.c.localtime_r(&t, &tm);
+        const t: c_long = @intCast(@divFloor(ms_total, 1000));
+        var tm: CTm = undefined;
+        _ = localtime_r(&t, &tm);
         return .{
             .month = @intCast(tm.tm_mon + 1),
             .day = @intCast(tm.tm_mday),
