@@ -7,6 +7,7 @@ const state = @import("state.zig");
 const net = @import("net.zig");
 const system = @import("system.zig");
 const config = @import("config.zig");
+const console = @import("console.zig");
 
 const VERSION = "0.1.3";
 
@@ -40,12 +41,13 @@ fn pollShare(ctx_ptr: *anyopaque) ?net.Share {
 fn setConnected(ctx_ptr: *anyopaque, connected: bool) void {
     const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr));
     ctx.s.connected.store(connected, .monotonic);
-    if (!connected) ctx.s.net_rtt_us.store(-1, .monotonic); // clear net: while disconnected
 }
 
-fn setNetRtt(ctx_ptr: *anyopaque, rtt_us: i64) void {
-    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr));
-    ctx.s.net_rtt_us.store(rtt_us, .monotonic);
+/// net.zig's log sink: route its INFO/WARN/ERROR lines (Connecting/Connected/...) through
+/// the timestamped console logger. ctx is unused -- the console writes to the shared stderr.
+fn netLog(ctx_ptr: *anyopaque, level: []const u8, msg: []const u8) void {
+    _ = ctx_ptr;
+    console.logLineRaw(level, msg);
 }
 
 fn shouldQuit(ctx_ptr: *anyopaque) bool {
@@ -90,17 +92,24 @@ fn usage() void {
     , .{});
 }
 
-fn selftest(alloc: std.mem.Allocator) !u8 {
+/// Run the pow("a") known-answer test, writing the lowercase hex digest into `hex_out`.
+/// Returns true on the expected digest. Pure (no printing) so both the startup KAT (silent
+/// on success, like the C miner) and the `--selftest` command can share it.
+fn powKat(alloc: std.mem.Allocator, hex_out: *[64]u8) !bool {
     const w = try alloc.create(pow.Worker);
     defer alloc.destroy(w);
     w.* = .{};
     defer w.deinitSA();
     var out: [32]u8 = undefined;
     try pow.hash("a", &out, w);
-    var hex: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&hex, "{s}", .{std.fmt.fmtSliceHexLower(&out)}) catch unreachable;
+    _ = std.fmt.bufPrint(hex_out, "{s}", .{std.fmt.fmtSliceHexLower(&out)}) catch unreachable;
     const expected = "54e2324ddacc3f0383501a9e5760f85d63e9bc6705e9124ca7aef89016ab81ea";
-    const pass = std.mem.eql(u8, &hex, expected);
+    return std.mem.eql(u8, hex_out, expected);
+}
+
+fn selftest(alloc: std.mem.Allocator) !u8 {
+    var hex: [64]u8 = undefined;
+    const pass = try powKat(alloc, &hex);
     std.debug.print("selftest pow(a): {s} {s}\n", .{ hex, if (pass) "PASS" else "FAIL" });
     return if (pass) 0 else 1;
 }
@@ -127,13 +136,6 @@ fn fmtDiff(buf: []u8, d: u64) []const u8 {
     if (d >= 1_000_000) return std.fmt.bufPrint(buf, "{d}M", .{d / 1_000_000}) catch "?";
     if (d >= 1_000) return std.fmt.bufPrint(buf, "{d}K", .{d / 1_000}) catch "?";
     return std.fmt.bufPrint(buf, "{d}", .{d}) catch "?";
-}
-
-/// Format net RTT (microseconds; -1 = unavailable) as the C does: --, <1ms, or Nms.
-fn fmtNet(buf: []u8, us: i64) []const u8 {
-    if (us < 0) return "--";
-    if (us < 1000) return "<1ms";
-    return std.fmt.bufPrint(buf, "{d}ms", .{@divTrunc(us, 1000)}) catch "?";
 }
 
 fn reporter() void {
@@ -163,21 +165,18 @@ fn reporter() void {
         const rejected = G.rejected.load(.monotonic);
         var dbuf: [24]u8 = undefined;
         const diff = fmtDiff(&dbuf, G.difficulty.load(.monotonic));
-        var nbuf: [16]u8 = undefined;
-        const netstr = fmtNet(&nbuf, G.net_rtt_us.load(.monotonic));
 
         if (tty) {
             const rejcol = if (rejected > 0) A_BRED else A_WHITE;
-            std.debug.print("\r{s}[DIRTYBIRD] {s}{d:.2} KH/s{s} ({s}{d:.2} KH/s avg{s}) | {s}Height:{d}{s} | {s}Miniblocks:{d}{s} | {s}Blocks:{d}{s} | {s}REJ:{d}{s} | {s}Diff:{s}{s} | {s}net:{s}{s} | {s}{d:0>2}:{d:0>2}:{d:0>2}{s}{s}      ", .{
+            std.debug.print("\r{s}[DIRTYBIRD] {s}{d:.2} KH/s{s} ({s}{d:.2} KH/s avg{s}) | {s}Height:{d}{s} | {s}Miniblocks:{d}{s} | {s}Blocks:{d}{s} | {s}REJ:{d}{s} | {s}Diff:{s}{s} | {s}{d:0>2}:{d:0>2}:{d:0>2}{s}{s}      ", .{
                 A_BYELLOW, A_BGREEN, rate,     A_BWHITE, A_GREEN,  avg,       A_BWHITE,
                 A_BLUE,    height,   A_BWHITE, A_CYAN,   accepted, A_BWHITE,  A_GREEN,
                 blocks,    A_BWHITE, rejcol,   rejected, A_BWHITE, A_MAGENTA, diff,
-                A_BWHITE,  A_CYAN,   netstr,   A_BWHITE, A_WHITE,  hh,        mm,
-                ss,        A_RESET,  A_CLREOL,
+                A_BWHITE,  A_WHITE,  hh,       mm,       ss,       A_RESET,   A_CLREOL,
             });
         } else {
-            std.debug.print("[DIRTYBIRD] {d:.2} KH/s ({d:.2} KH/s avg) | Height:{d} | Miniblocks:{d} | Blocks:{d} | REJ:{d} | Diff:{s} | net:{s} | {d:0>2}:{d:0>2}:{d:0>2}\n", .{
-                rate, avg, height, accepted, blocks, rejected, diff, netstr, hh, mm, ss,
+            std.debug.print("[DIRTYBIRD] {d:.2} KH/s ({d:.2} KH/s avg) | Height:{d} | Miniblocks:{d} | Blocks:{d} | REJ:{d} | Diff:{s} | {d:0>2}:{d:0>2}:{d:0>2}\n", .{
+                rate, avg, height, accepted, blocks, rejected, diff, hh, mm, ss,
             });
         }
 
@@ -236,7 +235,8 @@ fn loadConfig(alloc: std.mem.Allocator, path: []const u8, nthreads: *usize, cfg_
         cfg_threads.* = t;
         if (t > 0) nthreads.* = @intCast(t);
     }
-    std.debug.print("config : loaded {s}\n", .{path});
+    // Silent on success to match the C miner's display (it prints nothing before the
+    // banner). The no-config / parse-error diagnostics above remain for misconfiguration.
     return true;
 }
 
@@ -363,13 +363,18 @@ pub fn main() !u8 {
     if (nthreads == 0) nthreads = std.Thread.getCpuCount() catch 4;
     G.nthreads = nthreads;
 
-    std.debug.print("zig-miner v{s}\n  server : {s}:{d}\n  wallet : {s}\n  threads: {d}\n\n", .{ VERSION, G.host, G.port, G.wallet, nthreads });
+    // Startup banner -- timestamped INFO lines matching the Dirtybird C miner.
+    console.logLine("INFO", "Dirtybird Miner", .{});
+    console.logLine("INFO", "Server:  {s}:{d}", .{ G.host, G.port });
+    console.logLine("INFO", "Wallet:  {s}", .{G.wallet});
+    console.logLine("INFO", "Threads: {d}", .{nthreads});
+    std.debug.print("\n", .{}); // blank line before Connecting (C: trailing printf("\n"))
 
-    // Startup KAT (matches the C miner's pow("a") check).
+    // Startup KAT (matches the C miner's pow("a") check; silent on success, like the C).
     {
-        const code = try selftest(alloc);
-        if (code != 0) {
-            std.debug.print("FATAL: pow(\"a\") self-test failed; refusing to mine.\n", .{});
+        var hex: [64]u8 = undefined;
+        if (!try powKat(alloc, &hex)) {
+            console.logLine("ERROR", "pow(\"a\") self-test failed; refusing to mine.", .{});
             return 1;
         }
     }
@@ -408,7 +413,7 @@ pub fn main() !u8 {
         .on_job = onJob,
         .poll_share = pollShare,
         .set_connected = setConnected,
-        .set_net_rtt = setNetRtt,
+        .log = netLog,
         .should_quit = shouldQuit,
     };
     const cfg = net.Config{ .host = G.host, .port = G.port, .wallet = G.wallet };

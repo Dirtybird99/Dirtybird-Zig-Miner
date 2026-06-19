@@ -46,7 +46,6 @@ pub const MinerState = struct {
     submitted: Atomic(i64) = Atomic(i64).init(0),
     stale_drops: Atomic(i64) = Atomic(i64).init(0),
     submit_drops: Atomic(i64) = Atomic(i64).init(0), // found a share but the ring was full
-    net_rtt_us: Atomic(i64) = Atomic(i64).init(-1), // kernel TCP RTT (us); -1 = unavailable
 
     // ---- config (set once at startup, read-only after) ----
     // Compiled-in backstop defaults: a user who forgets -w/-d (and has no config.json)
