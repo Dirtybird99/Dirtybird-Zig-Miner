@@ -79,8 +79,10 @@ fn installSignalHandler() void {
 
 fn usage() void {
     std.debug.print(
-        \\Usage: zig-miner [-d host:port] [-w wallet] [-t threads] [-c config.json] [-V] [--selftest]
-        \\  -d  daemon/pool address host:port  (default community-pools.mysrv.cloud:10300)
+        \\Usage: zig-miner [-d [ws://|wss://]host:port] [-w wallet] [-t threads] [-c config.json] [-V] [--selftest]
+        \\  -d  daemon/pool address [scheme://]host:port  (default community-pools.mysrv.cloud:10300)
+        \\        DERO getwork (local derod AND pools) is TLS: bare and wss:// connect over TLS.
+        \\        ws:// forces plaintext (only for getwork behind a TLS-terminating proxy).
         \\  -w  DERO wallet address            (default from config.json / built-in)
         \\  -t  mining threads                 (default: logical CPU count)
         \\  -c, --config-file <path>           config file (default: config.json)
@@ -189,13 +191,29 @@ fn reporter() void {
     }
 }
 
-/// Split "host:port" into G.host/G.port (port optional; keeps the current port on parse
-/// failure). Shared by the -d flag and the config.json daemon-address.
-fn setDaemon(hp: []const u8) void {
+/// Parse "[wss://|ws://]host:port" into G.host/G.port and pick the transport (G.tls).
+/// DERO getwork -- a local `derod` daemon (`Getwork_server` listens with `AddrsTLS` + a
+/// self-signed cert) AND public pools -- is TLS (`wss://`), which is why every miner uses
+/// verify-none. So a bare address defaults to TLS; `wss://` is explicit TLS; `ws://` forces
+/// plaintext (only useful if getwork is fronted by a TLS-terminating proxy). Port optional
+/// (keeps the current port on parse failure). Shared by -d and the config.json daemon-address.
+fn setDaemon(hp_in: []const u8) void {
+    var hp = hp_in;
+    var explicit_tls: ?bool = null;
+    if (std.mem.startsWith(u8, hp, "wss://")) {
+        explicit_tls = true;
+        hp = hp["wss://".len..];
+    } else if (std.mem.startsWith(u8, hp, "ws://")) {
+        explicit_tls = false;
+        hp = hp["ws://".len..];
+    }
+    // Tolerate a trailing path (e.g. wss://host:port/ws/...) -- the wallet supplies the path.
+    if (std.mem.indexOfScalar(u8, hp, '/')) |slash| hp = hp[0..slash];
     if (std.mem.lastIndexOfScalar(u8, hp, ':')) |c| {
         G.host = hp[0..c];
         G.port = std.fmt.parseInt(u16, hp[c + 1 ..], 10) catch G.port;
     } else G.host = hp;
+    G.tls = explicit_tls orelse true; // DERO getwork is TLS; bare addresses connect over wss://
 }
 
 /// Absolute path to config.json next to the running executable, or null if unresolved.
@@ -365,7 +383,7 @@ pub fn main() !u8 {
 
     // Startup banner -- timestamped INFO lines matching the Dirtybird C miner.
     console.logLine("INFO", "Dirtybird Miner", .{});
-    console.logLine("INFO", "Server:  {s}:{d}", .{ G.host, G.port });
+    console.logLine("INFO", "Server:  {s}://{s}:{d}", .{ if (G.tls) "wss" else "ws", G.host, G.port });
     console.logLine("INFO", "Wallet:  {s}", .{G.wallet});
     console.logLine("INFO", "Threads: {d}", .{nthreads});
     std.debug.print("\n", .{}); // blank line before Connecting (C: trailing printf("\n"))
@@ -390,21 +408,84 @@ pub fn main() !u8 {
     }
 
     // Mining-thread workers: TWO per thread (one per lane of the batched, 2-way
-    // multi-buffer SHA in mineThread/pow.hash2).
+    // multi-buffer SHA in mineThread/pow.hash2). Each thread's lane pair (indices
+    // 2*idx and 2*idx+1) is packed into ONE 2MB large page on Windows so the hot
+    // sData/sa buffers (~360KB each) get large-page TLB coverage -- measured +4%
+    // at saturation. Mirrors the proven bench2.zig `hp` path; falls back to the
+    // normal heap when large pages decline (or on non-Windows).
     const workers = try alloc.alloc(*pow.Worker, nthreads * 2);
     defer alloc.free(workers);
-    // One defer over the successfully-created prefix frees exactly `created`
-    // workers on any exit -- a partial-construction OOM error or normal shutdown --
-    // with no leak and no double-free.
+    // Per-pair large-page backing: backings[idx] is the 2-worker block for lane
+    // pair idx, or null if that pair came from the heap. Declared (and its free
+    // defer registered) BEFORE the worker-cleanup defer so LIFO keeps both
+    // `backings` and `workers` valid while cleanup runs.
+    const backings = try alloc.alloc(?[]align(4096) u8, nthreads);
+    defer alloc.free(backings);
+    for (backings) |*b| b.* = null;
+    // Cleanup over the successfully-created prefix: exactly `created` workers and
+    // their backings are released on any exit -- a partial-construction OOM error
+    // or normal shutdown -- with no leak and no double-free. Two-phase: deinitSA
+    // every created worker FIRST, then free the backings. Both workers of a packed
+    // pair live inside the same large-page block, and deinitSA reads fields inside
+    // that block, so the block must not be freed until both have been deinit'd.
     var created: usize = 0;
-    defer for (workers[0..created]) |wp| {
-        wp.deinitSA();
-        alloc.destroy(wp);
-    };
-    for (workers) |*wp| {
-        wp.* = try alloc.create(pow.Worker);
-        wp.*.* = .{};
-        created += 1;
+    defer {
+        for (workers[0..created]) |wp| wp.deinitSA();
+        for (backings) |b| {
+            if (b) |buf| {
+                if (comptime builtin.os.tag == .windows) system.freeLargePages(buf);
+            }
+        }
+        // Heap-allocated workers (no large-page backing for their pair) are freed
+        // individually. A pair is heap-backed iff backings[pair] is null.
+        for (workers[0..created], 0..) |wp, wi| {
+            if (backings[wi / 2] == null) alloc.destroy(wp);
+        }
+    }
+    {
+        var idx: usize = 0;
+        while (idx < nthreads) : (idx += 1) {
+            const lane0 = 2 * idx;
+            const lane1 = lane0 + 1;
+            // Try one large page for the lane pair. On success both workers live
+            // in it and `created` jumps by 2 with no fallible op in between, so a
+            // large-page pair is always complete (never half-built).
+            if (comptime builtin.os.tag == .windows) {
+                if (system.allocLargePages(2 * @sizeOf(pow.Worker))) |buf| {
+                    backings[idx] = buf;
+                    const w0: *pow.Worker = @ptrCast(@alignCast(buf.ptr));
+                    const w1: *pow.Worker = @ptrCast(@alignCast(buf.ptr + @sizeOf(pow.Worker)));
+                    w0.* = .{};
+                    w1.* = .{};
+                    workers[lane0] = w0;
+                    created += 1;
+                    workers[lane1] = w1;
+                    created += 1;
+                    continue;
+                }
+            }
+            // Heap fallback: each worker is created independently so a `try` OOM
+            // mid-pair leaves `created` exact (odd if w0 succeeded but w1 failed),
+            // and cleanup frees only what was built.
+            workers[lane0] = try alloc.create(pow.Worker);
+            workers[lane0].* = .{};
+            created += 1;
+            workers[lane1] = try alloc.create(pow.Worker);
+            workers[lane1].* = .{};
+            created += 1;
+        }
+    }
+
+    // Report actual large-page coverage. The 24t saturation win depends on the
+    // worker buffers really landing in 2MB pages (one page per lane pair); a warm
+    // box or insufficient SeLockMemoryPrivilege can decline some/all of them and
+    // silently fall back to heap. Logging it makes "the win shipped" verifiable.
+    if (builtin.os.tag == .windows) {
+        var lp_pairs: usize = 0;
+        for (backings) |b| {
+            if (b != null) lp_pairs += 1;
+        }
+        console.logLine("INFO", "Large pages: {d}/{d} worker pairs ({d} MB locked)", .{ lp_pairs, nthreads, lp_pairs * 2 });
     }
 
     var ctx = Ctx{ .s = &G };
@@ -416,7 +497,7 @@ pub fn main() !u8 {
         .log = netLog,
         .should_quit = shouldQuit,
     };
-    const cfg = net.Config{ .host = G.host, .port = G.port, .wallet = G.wallet };
+    const cfg = net.Config{ .host = G.host, .port = G.port, .wallet = G.wallet, .tls = G.tls };
 
     const net_thread = try std.Thread.spawn(.{}, net.run, .{ alloc, cfg, hooks });
     const rpt_thread = try std.Thread.spawn(.{}, reporter, .{});

@@ -52,6 +52,9 @@ pub const MinerState = struct {
     // still mines to the community pool. config.json and CLI flags override these.
     host: []const u8 = "community-pools.mysrv.cloud",
     port: u16 = 10300,
+    // Transport for the getwork WebSocket: true => TLS (wss://, the default pool);
+    // false => plaintext (ws://, a local derod daemon). Set from the -d/config scheme.
+    tls: bool = true,
     wallet: []const u8 = "dero1qyvuemd6z0uzsx5ufc99f0jhyzvvpysmrd2t3526ht7a9dfh7jve2qqt0vu5y",
     nthreads: usize = 0,
 

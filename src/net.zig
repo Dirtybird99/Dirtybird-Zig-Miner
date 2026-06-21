@@ -80,6 +80,8 @@ pub const Config = struct {
     host: []const u8,
     port: u16,
     wallet: []const u8,
+    /// true => TLS (wss://, pools); false => plaintext (ws://, a local derod daemon).
+    tls: bool,
 };
 
 pub const Share = struct {
@@ -497,11 +499,23 @@ const BACKOFF_MAX_MS: i64 = 30000;
 
 const Conn = struct {
     netstream: std.net.Stream, // owns the socket handle
-    client: tls.Client,
+    client: ?tls.Client, // null => plaintext ws:// (local daemon); set => TLS wss:// (pool)
     timeout_ms: u32,
 
     fn stream(self: *Conn) SelectStream {
         return .{ .handle = self.netstream.handle, .timeout_ms = self.timeout_ms };
+    }
+    // Unified app I/O so the upgrade handshake, frame reads, and share writes are
+    // transport-agnostic: TLS when a client is present, else the raw socket.
+    fn read(self: *Conn, buffer: []u8) !usize {
+        if (self.client) |*c| return c.read(self.stream(), buffer);
+        return self.stream().read(buffer);
+    }
+    fn writeAll(self: *Conn, bytes: []const u8) !void {
+        if (self.client) |*c| return c.writeAll(self.stream(), bytes);
+        const s = self.stream();
+        var off: usize = 0;
+        while (off < bytes.len) off += try s.write(bytes[off..]);
     }
     fn close(self: *Conn) void {
         // Close on the same thread that reads -- no cross-thread unblock needed.
@@ -554,17 +568,21 @@ fn connectAndUpgrade(
         try std.posix.connect(fd, &target.any, target.getOsSockLen());
         break :blk std.net.Stream{ .handle = fd };
     };
-    var conn = Conn{ .netstream = netstream, .client = undefined, .timeout_ms = CONNECT_TIMEOUT_MS };
+    var conn = Conn{ .netstream = netstream, .client = null, .timeout_ms = CONNECT_TIMEOUT_MS };
     errdefer conn.close();
 
     setTcpNoDelay(netstream.handle);
     setSndTimeout(netstream.handle, CONNECT_TIMEOUT_MS);
 
-    // ---- TLS handshake, verification disabled (mirrors SSL_VERIFY_NONE) ----
-    conn.client = try tls.Client.init(conn.stream(), .{
-        .host = .no_verification,
-        .ca = .no_verification,
-    });
+    // ---- TLS handshake (wss://), verification disabled (mirrors SSL_VERIFY_NONE).
+    //      Skipped for plaintext ws:// (a local derod daemon): the client stays null
+    //      and Conn.read/writeAll route straight to the raw socket. ----
+    if (cfg.tls) {
+        conn.client = try tls.Client.init(conn.stream(), .{
+            .host = .no_verification,
+            .ca = .no_verification,
+        });
+    }
 
     // ---- HTTP upgrade ----
     var keyraw: [16]u8 = undefined;
@@ -579,7 +597,7 @@ fn connectAndUpgrade(
         "Connection: Upgrade\r\n" ++
         "Sec-WebSocket-Key: {s}\r\n" ++
         "Sec-WebSocket-Version: 13\r\n\r\n", .{ cfg.wallet, cfg.host, cfg.port, wskey });
-    try conn.client.writeAll(conn.stream(), req);
+    try conn.writeAll(req);
 
     // ---- Read HTTP response until \r\n\r\n; keep bytes past it. ----
     var resp: [4096]u8 = undefined;
@@ -590,7 +608,7 @@ fn connectAndUpgrade(
         // forever (defeating the per-read timeout) -- both guards the C has.
         if (hooks.should_quit(hooks.ctx)) return error.Shutdown;
         if (std.time.milliTimestamp() - connect_start >= CONNECT_DEADLINE_MS) return error.UpgradeStalled;
-        const n = conn.client.read(conn.stream(), resp[total..]) catch |e| {
+        const n = conn.read(resp[total..]) catch |e| {
             // A timeout during upgrade is treated as a stalled handshake.
             if (e == error.WouldBlock) return error.UpgradeStalled;
             return e;
@@ -648,12 +666,12 @@ fn setSndTimeout(handle: std.posix.socket_t, ms: u32) void {
     // POSIX: intentional no-op (see doc comment).
 }
 
-/// Send a masked WebSocket frame over the TLS connection.
+/// Send a masked WebSocket frame over the connection (TLS or plaintext).
 fn sendFrame(conn: *Conn, scratch: []u8, opcode: u8, payload: []const u8) !void {
     var mask: [4]u8 = undefined;
     std.crypto.random.bytes(&mask);
     const frame = wsEncodeFrame(scratch, opcode, payload, mask);
-    try conn.client.writeAll(conn.stream(), frame);
+    try conn.writeAll(frame);
 }
 
 /// Blocking connect+reconnect run loop. Runs on a dedicated thread supplied by
@@ -742,7 +760,7 @@ fn sessionLoop(
         // fires on full-record idleness. Bounded by the peer's pace; a fully
         // silent peer still surfaces WouldBlock and is handled. Fixing fully needs
         // a record-level read loop; deferred as disproportionate.
-        const n = conn.client.read(conn.stream(), &read_buf) catch |e| {
+        const n = conn.read(&read_buf) catch |e| {
             if (e == error.WouldBlock) {
                 // Dead-link watchdog: a silently-dropped TCP (no FIN/RST) returns
                 // WouldBlock forever. If no inbound bytes (job OR ping) have arrived
