@@ -8,6 +8,8 @@ const net = @import("net.zig");
 const system = @import("system.zig");
 const config = @import("config.zig");
 const console = @import("console.zig");
+const pages = @import("pages.zig");
+const cpu_features = @import("cpu_features.zig");
 
 const VERSION = "0.1.3";
 
@@ -118,8 +120,8 @@ fn selftest(alloc: std.mem.Allocator) !u8 {
 
 var g_verbose = false;
 
-// ANSI SGR colors matching the C miner (dirtybird-miner src/main.cpp). VT is enabled on
-// Windows; the reporter emits these only when stderr is a TTY (plain text when piped).
+// ANSI SGR colors matching the C miner (dirtybird-miner src/main.cpp). The reporter
+// forces the colored in-place banner even when stderr is not detected as a TTY.
 const A_RESET = "\x1b[0m";
 const A_CLREOL = "\x1b[K";
 const A_BYELLOW = "\x1b[93m";
@@ -140,11 +142,55 @@ fn fmtDiff(buf: []u8, d: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{d}", .{d}) catch "?";
 }
 
+const ReportStats = struct {
+    rate: f64,
+    avg: f64,
+    height: i64,
+    accepted: i64,
+    blocks: i64,
+    rejected: i64,
+    diff: []const u8,
+    hh: u64,
+    mm: u64,
+    ss: u64,
+    verbose: bool = false,
+    submitted: i64 = 0,
+    stale_drops: i64 = 0,
+    submit_drops: i64 = 0,
+};
+
+fn formatStatusLine(buf: []u8, stats: ReportStats) []const u8 {
+    return formatStatusLineChecked(buf, stats) catch "\r" ++ A_CLREOL;
+}
+
+fn formatStatusLineChecked(buf: []u8, stats: ReportStats) ![]const u8 {
+    const rejcol = if (stats.rejected > 0) A_BRED else A_WHITE;
+    var stream = std.io.fixedBufferStream(buf);
+    const writer = stream.writer();
+
+    try writer.print("\r{s}[DIRTYBIRD] ", .{A_BYELLOW});
+    try writer.print("{s}{d:.2} KH/s{s} ({s}{d:.2} KH/s avg{s})", .{
+        A_BGREEN, stats.rate, A_BWHITE, A_GREEN, stats.avg, A_BWHITE,
+    });
+    try writer.print(" | {s}Height:{d}{s}", .{ A_BLUE, stats.height, A_BWHITE });
+    try writer.print(" | {s}Miniblocks:{d}{s}", .{ A_CYAN, stats.accepted, A_BWHITE });
+    try writer.print(" | {s}Blocks:{d}{s}", .{ A_GREEN, stats.blocks, A_BWHITE });
+    try writer.print(" | {s}REJ:{d}{s}", .{ rejcol, stats.rejected, A_BWHITE });
+    try writer.print(" | {s}Diff:{s}{s}", .{ A_MAGENTA, stats.diff, A_BWHITE });
+    try writer.print(" | {s}{d:0>2}:{d:0>2}:{d:0>2}{s}", .{ A_WHITE, stats.hh, stats.mm, stats.ss, A_BWHITE });
+    if (stats.verbose) {
+        try writer.print(" | funnel submitted:{d} acc:{d} rej:{d} stale:{d} sendfail:{d}", .{
+            stats.submitted, stats.accepted, stats.rejected, stats.stale_drops, stats.submit_drops,
+        });
+    }
+    try writer.print("{s}{s}", .{ A_RESET, A_CLREOL });
+    return stream.getWritten();
+}
+
 fn reporter() void {
     var prev: i64 = 0;
     const t0 = std.time.milliTimestamp();
     var prev_t = t0;
-    const tty = std.io.getStdErr().isTty();
     while (!G.quit.load(.monotonic)) {
         std.time.sleep(std.time.ns_per_s);
         const now = std.time.milliTimestamp();
@@ -168,27 +214,70 @@ fn reporter() void {
         var dbuf: [24]u8 = undefined;
         const diff = fmtDiff(&dbuf, G.difficulty.load(.monotonic));
 
-        if (tty) {
-            const rejcol = if (rejected > 0) A_BRED else A_WHITE;
-            std.debug.print("\r{s}[DIRTYBIRD] {s}{d:.2} KH/s{s} ({s}{d:.2} KH/s avg{s}) | {s}Height:{d}{s} | {s}Miniblocks:{d}{s} | {s}Blocks:{d}{s} | {s}REJ:{d}{s} | {s}Diff:{s}{s} | {s}{d:0>2}:{d:0>2}:{d:0>2}{s}{s}      ", .{
-                A_BYELLOW, A_BGREEN, rate,     A_BWHITE, A_GREEN,  avg,       A_BWHITE,
-                A_BLUE,    height,   A_BWHITE, A_CYAN,   accepted, A_BWHITE,  A_GREEN,
-                blocks,    A_BWHITE, rejcol,   rejected, A_BWHITE, A_MAGENTA, diff,
-                A_BWHITE,  A_WHITE,  hh,       mm,       ss,       A_RESET,   A_CLREOL,
-            });
-        } else {
-            std.debug.print("[DIRTYBIRD] {d:.2} KH/s ({d:.2} KH/s avg) | Height:{d} | Miniblocks:{d} | Blocks:{d} | REJ:{d} | Diff:{s} | {d:0>2}:{d:0>2}:{d:0>2}\n", .{
-                rate, avg, height, accepted, blocks, rejected, diff, hh, mm, ss,
-            });
-        }
-
-        if (g_verbose) {
-            std.debug.print("\n[funnel] submitted:{d} acc:{d} rej:{d} stale:{d} sendfail:{d}\n", .{
-                G.submitted.load(.monotonic),   accepted,                        rejected,
-                G.stale_drops.load(.monotonic), G.submit_drops.load(.monotonic),
-            });
-        }
+        var line_buf: [1024]u8 = undefined;
+        const line = formatStatusLine(&line_buf, .{
+            .rate = rate,
+            .avg = avg,
+            .height = height,
+            .accepted = accepted,
+            .blocks = blocks,
+            .rejected = rejected,
+            .diff = diff,
+            .hh = hh,
+            .mm = mm,
+            .ss = ss,
+            .verbose = g_verbose,
+            .submitted = G.submitted.load(.monotonic),
+            .stale_drops = G.stale_drops.load(.monotonic),
+            .submit_drops = G.submit_drops.load(.monotonic),
+        });
+        std.debug.print("{s}", .{line});
     }
+}
+
+test "formatStatusLine always rewrites one colored status row" {
+    var buf: [512]u8 = undefined;
+    const line = formatStatusLine(&buf, .{
+        .rate = 23.76,
+        .avg = 20.71,
+        .height = 7212998,
+        .accepted = 1998,
+        .blocks = 262,
+        .rejected = 4,
+        .diff = "20K",
+        .hh = 0,
+        .mm = 0,
+        .ss = 5,
+    });
+
+    try std.testing.expect(std.mem.startsWith(u8, line, "\r" ++ A_BYELLOW ++ "[DIRTYBIRD] "));
+    try std.testing.expect(std.mem.indexOf(u8, line, "Height:7212998") != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, line, '\n') == null);
+    try std.testing.expect(std.mem.endsWith(u8, line, A_RESET ++ A_CLREOL));
+}
+
+test "formatStatusLine appends verbose counters to the same row" {
+    var buf: [512]u8 = undefined;
+    const line = formatStatusLine(&buf, .{
+        .rate = 1.0,
+        .avg = 2.0,
+        .height = 3,
+        .accepted = 4,
+        .blocks = 5,
+        .rejected = 6,
+        .diff = "7K",
+        .hh = 8,
+        .mm = 9,
+        .ss = 10,
+        .verbose = true,
+        .submitted = 11,
+        .stale_drops = 12,
+        .submit_drops = 13,
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, line, " | funnel submitted:11 acc:4 rej:6 stale:12 sendfail:13") != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, line, '\n') == null);
+    try std.testing.expect(std.mem.endsWith(u8, line, A_RESET ++ A_CLREOL));
 }
 
 /// Parse "[wss://|ws://]host:port" into G.host/G.port and pick the transport (G.tls).
@@ -386,6 +475,7 @@ pub fn main() !u8 {
     console.logLine("INFO", "Server:  {s}://{s}:{d}", .{ if (G.tls) "wss" else "ws", G.host, G.port });
     console.logLine("INFO", "Wallet:  {s}", .{G.wallet});
     console.logLine("INFO", "Threads: {d}", .{nthreads});
+    cpu_features.log(cpu_features.detect());
     std.debug.print("\n", .{}); // blank line before Connecting (C: trailing printf("\n"))
 
     // Startup KAT (matches the C miner's pow("a") check; silent on success, like the C).
@@ -409,17 +499,15 @@ pub fn main() !u8 {
 
     // Mining-thread workers: TWO per thread (one per lane of the batched, 2-way
     // multi-buffer SHA in mineThread/pow.hash2). Each thread's lane pair (indices
-    // 2*idx and 2*idx+1) is packed into ONE 2MB large page on Windows so the hot
-    // sData/sa buffers (~360KB each) get large-page TLB coverage -- measured +4%
-    // at saturation. Mirrors the proven bench2.zig `hp` path; falls back to the
-    // normal heap when large pages decline (or on non-Windows).
+    // 2*idx and 2*idx+1) is packed into one huge-page backing when the OS grants it
+    // (Windows large pages; Linux THP request), falling back to heap allocation.
     const workers = try alloc.alloc(*pow.Worker, nthreads * 2);
     defer alloc.free(workers);
     // Per-pair large-page backing: backings[idx] is the 2-worker block for lane
     // pair idx, or null if that pair came from the heap. Declared (and its free
     // defer registered) BEFORE the worker-cleanup defer so LIFO keeps both
     // `backings` and `workers` valid while cleanup runs.
-    const backings = try alloc.alloc(?[]align(4096) u8, nthreads);
+    const backings = try alloc.alloc(?pages.PageBacking, nthreads);
     defer alloc.free(backings);
     for (backings) |*b| b.* = null;
     // Cleanup over the successfully-created prefix: exactly `created` workers and
@@ -432,9 +520,7 @@ pub fn main() !u8 {
     defer {
         for (workers[0..created]) |wp| wp.deinitSA();
         for (backings) |b| {
-            if (b) |buf| {
-                if (comptime builtin.os.tag == .windows) system.freeLargePages(buf);
-            }
+            if (b) |backing| pages.freeHugeBacking(backing);
         }
         // Heap-allocated workers (no large-page backing for their pair) are freed
         // individually. A pair is heap-backed iff backings[pair] is null.
@@ -447,22 +533,21 @@ pub fn main() !u8 {
         while (idx < nthreads) : (idx += 1) {
             const lane0 = 2 * idx;
             const lane1 = lane0 + 1;
-            // Try one large page for the lane pair. On success both workers live
-            // in it and `created` jumps by 2 with no fallible op in between, so a
-            // large-page pair is always complete (never half-built).
-            if (comptime builtin.os.tag == .windows) {
-                if (system.allocLargePages(2 * @sizeOf(pow.Worker))) |buf| {
-                    backings[idx] = buf;
-                    const w0: *pow.Worker = @ptrCast(@alignCast(buf.ptr));
-                    const w1: *pow.Worker = @ptrCast(@alignCast(buf.ptr + @sizeOf(pow.Worker)));
-                    w0.* = .{};
-                    w1.* = .{};
-                    workers[lane0] = w0;
-                    created += 1;
-                    workers[lane1] = w1;
-                    created += 1;
-                    continue;
-                }
+            // Try one huge-page backing for the lane pair. On success both workers
+            // live in it and `created` jumps by 2 with no fallible op in between,
+            // so a huge-page pair is always complete (never half-built).
+            if (pages.allocHugeBacking(2 * @sizeOf(pow.Worker))) |backing| {
+                backings[idx] = backing;
+                const buf = backing.bytes;
+                const w0: *pow.Worker = @ptrCast(@alignCast(buf.ptr));
+                const w1: *pow.Worker = @ptrCast(@alignCast(buf.ptr + @sizeOf(pow.Worker)));
+                w0.* = .{};
+                w1.* = .{};
+                workers[lane0] = w0;
+                created += 1;
+                workers[lane1] = w1;
+                created += 1;
+                continue;
             }
             // Heap fallback: each worker is created independently so a `try` OOM
             // mid-pair leaves `created` exact (odd if w0 succeeded but w1 failed),
@@ -476,16 +561,22 @@ pub fn main() !u8 {
         }
     }
 
-    // Report actual large-page coverage. The 24t saturation win depends on the
-    // worker buffers really landing in 2MB pages (one page per lane pair); a warm
-    // box or insufficient SeLockMemoryPrivilege can decline some/all of them and
-    // silently fall back to heap. Logging it makes "the win shipped" verifiable.
-    if (builtin.os.tag == .windows) {
-        var lp_pairs: usize = 0;
+    // Report actual huge-page-backed pairs. Linux THP is advisory: successful
+    // madvise means requested, not guaranteed resident huge pages.
+    if (builtin.os.tag == .windows or builtin.os.tag == .linux) {
+        var backed_pairs: usize = 0;
+        var mapped_mb: usize = 0;
         for (backings) |b| {
-            if (b != null) lp_pairs += 1;
+            if (b) |backing| {
+                backed_pairs += 1;
+                mapped_mb += backing.mappedLen() / (1024 * 1024);
+            }
         }
-        console.logLine("INFO", "Large pages: {d}/{d} worker pairs ({d} MB locked)", .{ lp_pairs, nthreads, lp_pairs * 2 });
+        if (builtin.os.tag == .windows) {
+            console.logLine("INFO", "Large pages: {d}/{d} worker pairs ({d} MB locked)", .{ backed_pairs, nthreads, mapped_mb });
+        } else {
+            console.logLine("INFO", "Huge pages: {d}/{d} worker pairs (THP requested, {d} MB mapped)", .{ backed_pairs, nthreads, mapped_mb });
+        }
     }
 
     var ctx = Ctx{ .s = &G };

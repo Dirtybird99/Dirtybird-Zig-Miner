@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const pow = @import("pow.zig");
 const system = @import("system.zig");
+const pages = @import("pages.zig");
 
 const Ctx = struct {
     count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -36,14 +37,12 @@ fn worker(ctx: *Ctx, tid: usize) void {
             system.setThreadHighPriority();
         }
     }
-    var large_buf: ?[]align(4096) u8 = null;
+    var large_backing: ?pages.PageBacking = null;
     const w: *pow.Worker = blk: {
-        if (comptime builtin.os.tag == .windows) {
-            if (ctx.hp) {
-                if (system.allocLargePages(@sizeOf(pow.Worker))) |buf| {
-                    large_buf = buf;
-                    break :blk @ptrCast(@alignCast(buf.ptr));
-                }
+        if (ctx.hp) {
+            if (pages.allocHugeBacking(@sizeOf(pow.Worker))) |backing| {
+                large_backing = backing;
+                break :blk @ptrCast(@alignCast(backing.bytes.ptr));
             }
         }
         break :blk std.heap.page_allocator.create(pow.Worker) catch return;
@@ -51,8 +50,8 @@ fn worker(ctx: *Ctx, tid: usize) void {
     w.* = .{};
     defer {
         w.deinitSA();
-        if (large_buf) |buf| {
-            if (comptime builtin.os.tag == .windows) system.freeLargePages(buf);
+        if (large_backing) |backing| {
+            pages.freeHugeBacking(backing);
         } else std.heap.page_allocator.destroy(w);
     }
     var prng = std.Random.DefaultPrng.init(ctx.seed +% tid);
@@ -82,12 +81,15 @@ pub fn main() !void {
 
     var ctx = Ctx{ .aff = aff, .affmode = affmode, .hp = hp, .nthreads = nthreads };
     if (comptime builtin.os.tag == .windows) {
-        if (aff) {
+        if (aff or hp) {
             _ = system.enableLockMemoryPrivilege();
-            system.setProcessHighPriority();
-            std.debug.print("[affinity ON mode={d}, HIGH priority class]\n", .{affmode});
+            if (aff) {
+                system.setProcessHighPriority();
+                std.debug.print("[affinity ON mode={d}, HIGH priority class]\n", .{affmode});
+            }
         }
     }
+    if (hp and builtin.os.tag == .linux) std.debug.print("[huge-pages THP requested]\n", .{});
     const threads = try a.alloc(std.Thread, nthreads);
     defer a.free(threads);
 

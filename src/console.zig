@@ -8,6 +8,8 @@
 //!   ts = strftime("%d/%m %H:%M:%S", localtime), clr_eol = "\x1b[K".
 //! The C writes to stdout; we use stderr (std.debug.print) to share the one stream --
 //! and lock -- the reporter already uses (main.zig). Visually identical.
+//! The Zig miner forces the leading CR+clear sequence for every log line so a later
+//! INFO/WARN/ERROR line never lands in the middle of the live status banner.
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -80,24 +82,23 @@ fn nowLocal() LocalTime {
     }
 }
 
-/// Print one timestamped log line for a pre-formatted message. `level` is left-padded
-/// to width 5 (C's `%-5s`): "INFO "/"WARN "/"ERROR", giving two spaces after "INFO".
-/// On a TTY the leading `\r\x1b[K` overwrites the reporter's in-place stats line.
-pub fn logLineRaw(level: []const u8, msg: []const u8) void {
-    const lt = nowLocal();
+fn formatLogLine(buf: []u8, lt: LocalTime, level: []const u8, msg: []const u8) []const u8 {
     var lvl: [5]u8 = .{ ' ', ' ', ' ', ' ', ' ' };
     const n = @min(level.len, lvl.len);
     @memcpy(lvl[0..n], level[0..n]);
 
-    if (std.io.getStdErr().isTty()) {
-        std.debug.print("\r{s}{d:0>2}/{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}  {s} {s}\n", .{
-            A_CLREOL, lt.day, lt.month, lt.hour, lt.minute, lt.second, lt.millis, lvl[0..], msg,
-        });
-    } else {
-        std.debug.print("{d:0>2}/{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}  {s} {s}\n", .{
-            lt.day, lt.month, lt.hour, lt.minute, lt.second, lt.millis, lvl[0..], msg,
-        });
-    }
+    return std.fmt.bufPrint(buf, "\r{s}{d:0>2}/{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}  {s} {s}\n", .{
+        A_CLREOL, lt.day, lt.month, lt.hour, lt.minute, lt.second, lt.millis, lvl[0..], msg,
+    }) catch buf[0..0];
+}
+
+/// Print one timestamped log line for a pre-formatted message. `level` is left-padded
+/// to width 5 (C's `%-5s`): "INFO "/"WARN "/"ERROR", giving two spaces after "INFO".
+/// The leading `\r\x1b[K` overwrites the reporter's in-place stats line.
+pub fn logLineRaw(level: []const u8, msg: []const u8) void {
+    const lt = nowLocal();
+    var buf: [1024]u8 = undefined;
+    std.debug.print("{s}", .{formatLogLine(&buf, lt, level, msg)});
 }
 
 /// Convenience for callers with a comptime format (the startup banner). Formats into a
@@ -106,4 +107,18 @@ pub fn logLine(level: []const u8, comptime fmt: []const u8, args: anytype) void 
     var buf: [512]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..0];
     logLineRaw(level, msg);
+}
+
+test "formatLogLine clears any live status row before logging" {
+    var buf: [128]u8 = undefined;
+    const line = formatLogLine(&buf, .{
+        .month = 6,
+        .day = 19,
+        .hour = 13,
+        .minute = 27,
+        .second = 12,
+        .millis = 466,
+    }, "INFO", "Connected");
+
+    try std.testing.expectEqualStrings("\r\x1b[K19/06 13:27:12.466  INFO  Connected\n", line);
 }
