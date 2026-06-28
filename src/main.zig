@@ -90,6 +90,7 @@ fn usage() void {
         \\  -c, --config-file <path>           config file (default: config.json)
         \\  -V  verbose
         \\  --selftest  run pow("a") KAT and exit (0=PASS,1=FAIL)
+        \\  --bench     run an AstroBWTv3 hashrate benchmark (~5s) and exit
         \\  --setup     interactively write config.json (pool/wallet/threads), then exit
         \\  -h, --help / -v, --version
         \\
@@ -116,6 +117,31 @@ fn selftest(alloc: std.mem.Allocator) !u8 {
     const pass = try powKat(alloc, &hex);
     std.debug.print("selftest pow(a): {s} {s}\n", .{ hex, if (pass) "PASS" else "FAIL" });
     return if (pass) 0 else 1;
+}
+
+/// `--bench`: AstroBWTv3 hashrate benchmark (Go dero-miner `--testnet`/bench path runs
+/// the PoW in a tight loop, no networking). Single thread, ~5s, reports H/s. Each
+/// iteration varies the nonce in the work blob so the BWT input differs every hash.
+fn bench(alloc: std.mem.Allocator) !u8 {
+    const w = try alloc.create(pow.Worker);
+    defer alloc.destroy(w);
+    w.* = .{};
+    defer w.deinitSA();
+
+    var input: [48]u8 = .{0} ** 48; // BLOB_SIZE work blob
+    var out: [32]u8 = undefined;
+    std.debug.print("benchmarking AstroBWTv3 (1 thread, ~5s)...\n", .{});
+    var timer = try std.time.Timer.start();
+    const duration_ns: u64 = 5 * std.time.ns_per_s;
+    var count: u64 = 0;
+    while (timer.read() < duration_ns) : (count += 1) {
+        std.mem.writeInt(u64, input[0..8], count, .little); // unique nonce per hash
+        try pow.hash(&input, &out, w);
+    }
+    const elapsed_s = @as(f64, @floatFromInt(timer.read())) / @as(f64, std.time.ns_per_s);
+    const hps = if (elapsed_s > 0) @as(f64, @floatFromInt(count)) / elapsed_s else 0;
+    std.debug.print("AstroBWTv3: {d} hashes in {d:.2}s = {d:.1} H/s\n", .{ count, elapsed_s, hps });
+    return 0;
 }
 
 var g_verbose = false;
@@ -356,6 +382,7 @@ pub fn main() !u8 {
     defer std.process.argsFree(alloc, args);
 
     var do_selftest = false;
+    var do_bench = false;
     var do_setup = false;
     var nthreads: usize = 0;
     var cfg_threads: i64 = -1; // raw config threads value (for --setup's "current" display)
@@ -405,6 +432,8 @@ pub fn main() !u8 {
             g_verbose = true;
         } else if (std.mem.eql(u8, a, "--selftest")) {
             do_selftest = true;
+        } else if (std.mem.eql(u8, a, "--bench")) {
+            do_bench = true;
         } else if (std.mem.eql(u8, a, "--setup")) {
             do_setup = true;
         } else if (std.mem.eql(u8, a, "-p") or std.mem.eql(u8, a, "--priority")) {
@@ -460,6 +489,7 @@ pub fn main() !u8 {
     }
 
     if (do_selftest) return selftest(alloc);
+    if (do_bench) return bench(alloc);
 
     if (G.wallet.len == 0) {
         std.debug.print("error: -w <wallet> is required\n", .{});
