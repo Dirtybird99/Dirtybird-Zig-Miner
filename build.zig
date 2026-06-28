@@ -61,6 +61,14 @@ pub fn build(b: *std.Build) void {
     };
     const target = b.standardTargetOptions(.{ .default_target = default_query });
 
+    // Position-independent executables. Android's loader (and Termux's system_linker_exec
+    // path on Android 10+) only accepts ET_DYN; a non-PIE ET_EXEC binary is rejected with
+    // "unexpected e_type: 2". So default PIE on for aarch64-linux (the arm64-linux-musl
+    // Termux/ARM artifact, and a future aarch64-linux-android build). x86_64/Windows/macOS
+    // keep Zig's defaults -- no PIE perf cost on the desktop hot path. Override with -Dpie.
+    const pie_opt = b.option(bool, "pie", "Position-independent executable (auto: on for aarch64-linux, e.g. Android/Termux)");
+    const want_pie = pie_opt orelse (target.result.os.tag == .linux and target.result.cpu.arch == .aarch64);
+
     const profile_rt = b.option([]const u8, "profile_rt", "Path to libclang_rt.profile-x86_64.a (required for -Dpgo=gen)");
     const pgo_opt = b.option([]const u8, "pgo", "PGO for the C/C++ suffix array: gen | use | off (default: use when _pgo/merged.profdata exists on x86_64)") orelse "use";
 
@@ -83,6 +91,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    if (want_pie) exe.pie = true;
     addSaDeps(exe, b, pgo, profile_rt);
     b.installArtifact(exe);
 
@@ -100,6 +109,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    if (want_pie) bench.pie = true;
     addSaDeps(bench, b, pgo, profile_rt);
     b.installArtifact(bench);
     const bench_run = b.addRunArtifact(bench);

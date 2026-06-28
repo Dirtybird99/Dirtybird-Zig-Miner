@@ -48,9 +48,17 @@ jobs:
       - uses: ./.github/actions/setup-zig
       # Cross-build a fully-static aarch64 musl binary and run its KAT under
       # qemu-user (no SHA-NI on ARM -> portable std.crypto path; KAT still validates).
-      - name: Cross-build aarch64 (static) + KAT under QEMU
+      # NOTE: qemu execs the binary directly (kernel-load) -- it proves the binary runs,
+      # but NOT Termux's system_linker_exec path (Android 10+ runs /system/bin/linker64
+      # ./zig-miner), which is the real Android gate. We assert ET_DYN here so a PIE
+      # regression (the "unexpected e_type: 2" Android failure) can't slip back in; the
+      # on-device --selftest is the authoritative Termux check.
+      - name: Cross-build aarch64 (static PIE) + KAT under QEMU
         run: |
           zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl -p out-arm64
+          readelf -h out-arm64/bin/zig-miner | grep -q 'Type:.*DYN' \
+            || { echo 'ERROR: arm64 binary is not PIE (ET_DYN) -- Android/Termux will reject it'; \
+                 readelf -h out-arm64/bin/zig-miner | grep -i type; exit 1; }
           sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static
           qemu-aarch64-static ./out-arm64/bin/zig-miner --selftest
 
