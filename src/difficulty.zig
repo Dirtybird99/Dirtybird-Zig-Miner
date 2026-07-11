@@ -4,13 +4,15 @@ const std = @import("std");
 
 pub fn computeTarget(difficulty: u64, target: *[32]u8) void {
     @memset(target, 0);
-    // Degenerate/invalid difficulty: accept every hash (all-0xFF), matching the
-    // reference C (deroTargetFromDiff). The local target is only a *submit filter* --
-    // the daemon does the real block validation -- so accept-all never misses a real
-    // block, whereas a reject-all (all-zero) target would guarantee zero finds while
-    // the difficulty is unset. In practice the daemon ships difficulty with every
-    // getwork job, so difficulty==0 is a transient that the miner gate normally skips.
-    if (difficulty == 0) {
+    // Degenerate difficulty: accept every hash (all-0xFF), matching the daemon. The
+    // local target is only a *submit filter* -- the daemon does the real block validation
+    // -- so accept-all never misses a real block, whereas a reject-all (all-zero) target
+    // would guarantee zero finds. d==0 is an unset transient. d==1's true target is
+    // 2^256 (ConvertIntegerDifficultyToBig(1)), which needs 33 bytes; the 32-byte long
+    // division below would drop the top digit and wrongly yield all-zero (reject-all), so
+    // fold d<=1 into the accept-all branch (all-0xFF == 2^256-1 accepts every 256-bit hash).
+    // d<=1 is simulator-only; a real derod never ships it.
+    if (difficulty <= 1) {
         @memset(target, 0xFF);
         return;
     }
@@ -57,6 +59,10 @@ test "computeTarget known values" {
     try std.testing.expect(checkHash(&maxhash, &t));
     var some = [_]u8{0x7F} ** 32;
     try std.testing.expect(checkHash(&some, &t));
+
+    computeTarget(1, &t); // d=1 -> true target 2^256; must be accept-all, not reject-all
+    for (t) |b| try std.testing.expectEqual(@as(u8, 0xFF), b);
+    try std.testing.expect(checkHash(&maxhash, &t));
 
     // Adversarial near-u64-max difficulty must not panic and yields a tiny target.
     computeTarget(std.math.maxInt(u64), &t);

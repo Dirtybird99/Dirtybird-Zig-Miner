@@ -62,9 +62,12 @@ pub const Job = struct {
     jobid_len: usize = 0,
     height: i64 = 0,
     difficulty: u64 = 0,
-    miniblocks: i64 = 0,
-    blocks: i64 = 0,
-    rejected: i64 = 0,
+    // Cumulative per-session counters from the getwork job. null => the field was absent,
+    // so the miner latches its last known value (matches the C ref) instead of flickering
+    // to 0. derod always sends these; a pool may omit them.
+    miniblocks: ?i64 = null,
+    blocks: ?i64 = null,
+    rejected: ?i64 = null,
 
     pub fn jobid(self: *const Job) []const u8 {
         return self.jobid_buf[0..self.jobid_len];
@@ -289,21 +292,27 @@ pub fn jsonStr(json: []const u8, key: []const u8) ?[]const u8 {
     return rest[0..qend];
 }
 
-/// Extract a bare int value for `"key":12345`, like the C's json_int.
-/// Returns 0 on miss or if the value is a string. Tolerates leading whitespace.
-pub fn jsonInt(json: []const u8, key: []const u8) i64 {
+/// Extract a bare int value for `"key":12345`. Returns null when the key is absent or the
+/// value is a string/malformed -- lets callers distinguish "field missing" (latch last
+/// value) from an explicit 0.
+pub fn jsonIntOpt(json: []const u8, key: []const u8) ?i64 {
     var pat_buf: [128]u8 = undefined;
-    const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\":", .{key}) catch return 0;
-    const start = std.mem.indexOf(u8, json, pat) orelse return 0;
+    const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\":", .{key}) catch return null;
+    const start = std.mem.indexOf(u8, json, pat) orelse return null;
     var p = start + pat.len;
     while (p < json.len and (json[p] == ' ' or json[p] == '\t')) p += 1;
-    if (p >= json.len or json[p] == '"') return 0; // string, not int
+    if (p >= json.len or json[p] == '"') return null; // string, not int
     // Parse optional sign + digits.
     var end = p;
     if (end < json.len and (json[end] == '-' or json[end] == '+')) end += 1;
     while (end < json.len and json[end] >= '0' and json[end] <= '9') end += 1;
-    if (end == p) return 0;
-    return std.fmt.parseInt(i64, json[p..end], 10) catch 0;
+    if (end == p) return null;
+    return std.fmt.parseInt(i64, json[p..end], 10) catch null;
+}
+
+/// Bare int value for `"key":12345`, like the C's json_int. Returns 0 on miss/string.
+pub fn jsonInt(json: []const u8, key: []const u8) i64 {
+    return jsonIntOpt(json, key) orelse 0;
 }
 
 pub const ParseError = error{ MissingBlob, MissingJobid, BadBlobLen, BadBlobHex };
@@ -329,9 +338,9 @@ pub fn parseJob(json: []const u8, out_lasterror: ?*?[]const u8) ParseError!Job {
     // hostile daemon) sanitizes to 0 (degenerate) rather than @bitCasting into a
     // huge u64 that would later crash the signed target math.
     job.difficulty = std.math.cast(u64, jsonInt(json, "difficultyuint64")) orelse 0;
-    job.miniblocks = jsonInt(json, "miniblocks");
-    job.blocks = jsonInt(json, "blocks");
-    job.rejected = jsonInt(json, "rejected");
+    job.miniblocks = jsonIntOpt(json, "miniblocks");
+    job.blocks = jsonIntOpt(json, "blocks");
+    job.rejected = jsonIntOpt(json, "rejected");
     return job;
 }
 
@@ -1025,18 +1034,21 @@ test "parseJob on realistic DERO getwork JSON" {
     try testing.expectEqualStrings("686f.0000abcd.deadbeef", job.jobid());
     try testing.expectEqual(@as(i64, 3456789), job.height);
     try testing.expectEqual(@as(u64, 123456789), job.difficulty);
-    try testing.expectEqual(@as(i64, 7), job.miniblocks);
-    try testing.expectEqual(@as(i64, 2), job.blocks);
-    try testing.expectEqual(@as(i64, 1), job.rejected);
+    try testing.expectEqual(@as(i64, 7), job.miniblocks.?);
+    try testing.expectEqual(@as(i64, 2), job.blocks.?);
+    try testing.expectEqual(@as(i64, 1), job.rejected.?);
     // Verify the blob decoded correctly.
     try testing.expectEqual(@as(u8, 0x01), job.blob[0]);
     try testing.expectEqual(@as(u8, 0x30), job.blob[47]);
 
-    // Field order independence.
+    // Field order independence + absent counters latch (null, not 0).
     const json2 = "{\"difficultyuint64\":999,\"height\":1,\"jobid\":\"x\",\"blockhashing_blob\":\"" ++ blob_hex ++ "\"}";
     const job2 = try parseJob(json2, null);
     try testing.expectEqual(@as(u64, 999), job2.difficulty);
     try testing.expectEqualStrings("x", job2.jobid());
+    try testing.expect(job2.miniblocks == null);
+    try testing.expect(job2.blocks == null);
+    try testing.expect(job2.rejected == null);
 }
 
 test "parseJob guards: missing fields, bad blob length, lasterror" {
