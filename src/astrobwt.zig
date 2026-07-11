@@ -309,5 +309,9 @@ pub fn wolfCompute(w: *Worker) void {
     const last = w.sData[chunk_off..][0..256];
     const tail: u64 = (@as(u64, last[253]) << 8 | @as(u64, last[254])) & 0x3ff;
     w.data_len = @intCast((@as(i64, w.tries) - 4) * 256 + @as(i64, @intCast(tail)));
-    while (w.data_len > 0 and w.sData[w.data_len - 1] == 0) w.data_len -= 1;
+    // NB: do NOT strip trailing zero bytes here. The DERO daemon
+    // (astrobwt/astrobwtv3/pow.go), TNN, and the dirtybird reference all build the
+    // suffix array over exactly data_len bytes and hash data_len*4 SA bytes -- a
+    // trailing-zero strip shortens the SA and diverges the hash for every nonce whose
+    // final data byte is 0x00, which the daemon then rejects on re-hash.
 }
