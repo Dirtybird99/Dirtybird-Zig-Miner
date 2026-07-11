@@ -59,6 +59,14 @@ pub fn mineThread(s: *MinerState, tid: usize, w0: *pow.Worker, w1: *pow.Worker) 
     }
 
     outer: while (!s.quit.load(.monotonic)) {
+        // While disconnected we can neither submit nor get fresh jobs; sleep instead of
+        // busy-spinning the outer loop (which would burn a core per thread through the
+        // reconnect backoff). The inner loop breaks here on drop (line ~79); this makes
+        // the outer "gate" actually wait, as its comment claims.
+        if (!s.connected.load(.monotonic)) {
+            std.time.sleep(50 * std.time.ns_per_ms);
+            continue;
+        }
         const snap = s.snapshotJob(&jbuf);
         @memcpy(&blob0, &snap.blob);
         @memcpy(&blob1, &snap.blob);
@@ -76,7 +84,7 @@ pub fn mineThread(s: *MinerState, tid: usize, w0: *pow.Worker, w1: *pow.Worker) 
             // doomed -- bail to the outer gate, which re-waits for `connected` and
             // resumes on the fresh job after reconnect.
             if (!s.connected.load(.monotonic)) break;
-            if ((nonce & 127) == 0 and s.job_epoch.load(.acquire) != epoch) break;
+            if ((nonce & 15) == 0 and s.job_epoch.load(.acquire) != epoch) break;
 
             writeNonce(&blob0, nonce +% 1);
             writeNonce(&blob1, nonce +% 2);

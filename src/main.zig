@@ -25,9 +25,11 @@ const Ctx = struct {
 fn onJob(ctx_ptr: *anyopaque, job: *const net.Job) void {
     const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr));
     _ = ctx.s.setJob(&job.blob, job.jobid(), job.height, job.difficulty);
-    ctx.s.accepted.store(job.miniblocks, .monotonic);
-    ctx.s.blocks.store(job.blocks, .monotonic);
-    ctx.s.rejected.store(job.rejected, .monotonic);
+    // Latch: only overwrite a counter when the job actually carried it, so a pool that
+    // omits these fields doesn't flicker the display to 0 (matches the C ref).
+    if (job.miniblocks) |m| ctx.s.accepted.store(m, .monotonic);
+    if (job.blocks) |b| ctx.s.blocks.store(b, .monotonic);
+    if (job.rejected) |r| ctx.s.rejected.store(r, .monotonic);
 }
 
 fn pollShare(ctx_ptr: *anyopaque) ?net.Share {
