@@ -113,3 +113,32 @@ test "KAT: pow(\"a\")" {
         &hex,
     );
 }
+
+// Regression: nonces whose final wolfCompute data byte is 0x00. A trailing-zero
+// strip on data_len (formerly in astrobwt.zig / oracle.cpp) shortens the suffix
+// array and diverges the hash from the DERO daemon on ~1% of nonces -- but the KAT
+// and the C++ oracle both ended in nonzero bytes / shared the strip, so nothing
+// caught it. These three 48-byte blobs hit the zero-final-byte case; the expected
+// hashes are the canonical daemon values (github.com/deroproject/derohe
+// astrobwtv3.AstroBWTv3, cross-checked over 20k inputs), NOT the local oracle.
+test "KAT: zero-final-byte blobs match the DERO daemon" {
+    const Vec = struct { in: []const u8, out: []const u8 };
+    const vectors = [_]Vec{
+        .{ .in = "c7376358448588908062349033c98868893c093683ba9a3f7dca1b9e19c946d3da8620f10e74289cd197164c145ff7e5", .out = "434c8f90a504f2d59fe3e935ba57a7bca0e5471913d5eff13b3f9797dc187d51" },
+        .{ .in = "6b3c191e1448516deac2ea4126f9a5cad6f2f7150f9847bd7b745ba99fddd8373e096c79c600d2cc087701ee8123f2d7", .out = "fa70f91840fa93383e1fad3612e210566427355438f2e6a8b68fc1f7f0a91658" },
+        .{ .in = "789e9f68144e6b62546c8058d53cfd2e9bd0ca2ccd758313d7d70d056cd6b9a63fd9a2148c16dbf6e9ea6515d62051c3", .out = "b4f6fae9dbfafd28a43361eaf2f907e4c885c416b4f0535978f17eea26028da9" },
+    };
+    const w = try std.testing.allocator.create(Worker);
+    defer std.testing.allocator.destroy(w);
+    w.* = .{};
+    defer w.deinitSA();
+    for (vectors) |v| {
+        var blob: [48]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&blob, v.in);
+        var out: [32]u8 = undefined;
+        try hash(&blob, &out, w);
+        var hex: [64]u8 = undefined;
+        _ = std.fmt.bufPrint(&hex, "{s}", .{std.fmt.fmtSliceHexLower(&out)}) catch unreachable;
+        try std.testing.expectEqualStrings(v.out, &hex);
+    }
+}
