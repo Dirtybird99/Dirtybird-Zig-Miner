@@ -22,20 +22,20 @@ The batched final SHA is independently checked to be byte-identical to `std.cryp
 
 ## Downloads
 
-Prebuilt binaries are on the [Releases](https://github.com/Dirtybird99/Dirtybird-Zig-Miner/releases) page, and are also browsable in-tree under [`releases/`](https://github.com/Dirtybird99/Dirtybird-Zig-Miner/tree/main/releases). Latest: **v0.1.4**.
+Prebuilt binaries are on the [Releases](https://github.com/Dirtybird99/Dirtybird-Zig-Miner/releases) page, and are also browsable in-tree under [`releases/`](https://github.com/Dirtybird99/Dirtybird-Zig-Miner/tree/main/releases). Latest: **v0.2.0**.
 
 | Platform | Download | Notes |
 |---|---|---|
-| Windows x64 | [win64 .zip](https://github.com/Dirtybird99/Dirtybird-Zig-Miner/releases/download/v0.1.4/Dirtybird-Zig-Miner-win64-v0.1.4.zip) | AVX2 + SHA-NI (AMD Zen / Intel Alder Lake+) |
-| Linux amd64 | [amd64 .tar.gz](https://github.com/Dirtybird99/Dirtybird-Zig-Miner/releases/download/v0.1.4/Dirtybird-Zig-Miner-amd64-v0.1.4.tar.gz) | static musl — runs on any Linux; AVX2 + SHA-NI |
-| Linux arm64 | [arm64 .tar.gz](https://github.com/Dirtybird99/Dirtybird-Zig-Miner/releases/download/v0.1.4/Dirtybird-Zig-Miner-arm64-v0.1.4.tar.gz) | static musl **PIE** (`ET_DYN`); ARM Linux & Android/Termux (portable SHA — no SHA-NI accel) |
-| macOS (Apple Silicon) | [macos-arm64 .tar.gz](https://github.com/Dirtybird99/Dirtybird-Zig-Miner/releases/download/v0.1.4/Dirtybird-Zig-Miner-macos-arm64-v0.1.4.tar.gz) | arm64; portable SHA (no SHA-NI accel) |
-| HiveOS / MMPOS | [hiveos_mmpos.amd64 .tar.gz](https://github.com/Dirtybird99/Dirtybird-Zig-Miner/releases/download/v0.1.4/dirtybird-zig-miner-v0.1.4.hiveos_mmpos.amd64.tar.gz) | amd64 custom-miner package (`config/` h-scripts) |
+| Windows x64 | [win64 .zip](https://github.com/Dirtybird99/Dirtybird-Zig-Miner/releases/download/v0.2.0/Dirtybird-Zig-Miner-win64-v0.2.0.zip) | AVX2 + SHA-NI (AMD Zen / Intel Alder Lake+) |
+| Linux amd64 | [amd64 .tar.gz](https://github.com/Dirtybird99/Dirtybird-Zig-Miner/releases/download/v0.2.0/Dirtybird-Zig-Miner-amd64-v0.2.0.tar.gz) | static musl — runs on any Linux; AVX2 + SHA-NI |
+| Linux arm64 | [arm64 .tar.gz](https://github.com/Dirtybird99/Dirtybird-Zig-Miner/releases/download/v0.2.0/Dirtybird-Zig-Miner-arm64-v0.2.0.tar.gz) | static musl **PIE** (`ET_DYN`); ARM Linux & Android/Termux (portable SHA — no SHA-NI accel) |
+| macOS (Apple Silicon) | [macos-arm64 .tar.gz](https://github.com/Dirtybird99/Dirtybird-Zig-Miner/releases/download/v0.2.0/Dirtybird-Zig-Miner-macos-arm64-v0.2.0.tar.gz) | arm64; portable SHA (no SHA-NI accel) |
+| HiveOS / MMPOS | [hiveos_mmpos.amd64 .tar.gz](https://github.com/Dirtybird99/Dirtybird-Zig-Miner/releases/download/v0.2.0/dirtybird-zig-miner-v0.2.0.hiveos_mmpos.amd64.tar.gz) | amd64 custom-miner package (`config/` h-scripts) |
 
 **HiveOS / MMPOS** — paste this into the flight sheet's *Installation URL*:
 
 ```
-https://github.com/Dirtybird99/Dirtybird-Zig-Miner/releases/download/v0.1.4/dirtybird-zig-miner-v0.1.4.hiveos_mmpos.amd64.tar.gz
+https://github.com/Dirtybird99/Dirtybird-Zig-Miner/releases/download/v0.2.0/dirtybird-zig-miner-v0.2.0.hiveos_mmpos.amd64.tar.gz
 ```
 
 Each archive bundles the binary, a ready-to-edit **`config.json`** (pool + wallet presets), `README`, `LICENSE`, `THIRD-PARTY-LICENSES`, the launcher (`script.sh` / `start.bat`), and (Linux) the HiveOS `config/`. Verify with the release's `SHA256SUMS.txt`. Or [build from source](#build).

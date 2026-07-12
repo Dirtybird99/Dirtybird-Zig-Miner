@@ -6,14 +6,18 @@
 //! develop in ReleaseSafe so a missed wrap panics at the exact site.
 const std = @import("std");
 const CodeLUT = @import("codelut.zig").CodeLUT;
-const sa_mod = @import("suffix_array.zig");
 const sa_fast = @import("sa_fast.zig");
+const sa_v114_pure = @import("sa_v114_pure.zig");
 const Rc4 = @import("primitives/rc4.zig").Rc4;
 const xxhash64 = @import("primitives/xxhash64.zig");
 const fnv1a = @import("primitives/fnv1a.zig");
 const siphash = @import("primitives/siphash.zig");
 
 pub const SCRATCH: usize = 72000 + 64; // MAX_LENGTH + 64
+comptime {
+    // sa_v114_pure keeps its own copy of SCRATCH to avoid an import cycle.
+    if (sa_v114_pure.SCRATCH != SCRATCH) @compileError("sa_v114_pure.SCRATCH must equal astrobwt.SCRATCH");
+}
 
 pub const Worker = struct {
     sData: [SCRATCH]u8 = undefined,
@@ -40,13 +44,13 @@ pub const Worker = struct {
     /// heap pointers so the libsais path's Worker stays lean (~360 KB).
     sa_scratch: ?*sa_fast.Scratch = null,
     sa_radix: ?*sa_fast.Radix8 = null,
+    sa_pure: ?*sa_v114_pure.Scratch = null,
 
-    /// Release the libsais context + any SA scratch. Safe to call repeatedly.
+    /// Release any SA scratch. Safe to call repeatedly. Note: `sa_ctx` (the
+    /// libsais context used only by dev/oracle tools) is intentionally NOT freed
+    /// here -- astrobwt is pure Zig and no longer links libsais; the oracle
+    /// harnesses own and free their own ctx.
     pub fn deinitSA(self: *Worker) void {
-        if (self.sa_ctx) |c| {
-            sa_mod.freeCtx(c);
-            self.sa_ctx = null;
-        }
         if (self.sa_scratch) |p| {
             std.heap.page_allocator.destroy(p);
             self.sa_scratch = null;
@@ -54,6 +58,10 @@ pub const Worker = struct {
         if (self.sa_radix) |p| {
             std.heap.page_allocator.destroy(p);
             self.sa_radix = null;
+        }
+        if (self.sa_pure) |p| {
+            std.heap.page_allocator.destroy(p);
+            self.sa_pure = null;
         }
     }
 };

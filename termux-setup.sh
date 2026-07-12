@@ -104,6 +104,11 @@ if have readelf; then
     warn "this zig-miner is not a PIE (ET_DYN) binary -- Android may reject it with 'e_type: 2'."
     warn "make sure you're on the latest release (PIE arm64 ships from v0.1.4)."
   fi
+
+  TLS_ALIGN="$(readelf -l ./zig-miner 2>/dev/null | awk '$1 == "TLS" { getline; print $NF; exit }')"
+  if [ -n "$TLS_ALIGN" ] && [ "$((TLS_ALIGN))" -lt 64 ]; then
+    die "this zig-miner has PT_TLS alignment $TLS_ALIGN; ARM64 Bionic requires at least 0x40. Install a newer arm64 release."
+  fi
 fi
 
 # ---- 6. configure (prompts default to any existing config.json) --------------

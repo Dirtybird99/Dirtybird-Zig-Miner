@@ -10,9 +10,8 @@
 # LICENSE, THIRD-PARTY-LICENSES, the launcher (script.sh / start.bat), and (Linux)
 # the HiveOS config/. Plus a HiveOS/MMPOS package and a SHA256SUMS.txt.
 #
-# x86-64 builds target an AVX2 + SHA-NI baseline (x86_64_v3+sha). They are NOT
-# PGO-optimized here (CI has no profile); for the absolute fastest binary do the
-# PGO build from source (see README) -- the hash output is identical either way.
+# x86-64 builds target an AVX2 + SHA-NI baseline (x86_64_v3+sha). The miner is pure
+# Zig (no C/C++, no PGO) -- ReleaseFast is the shipped configuration on every target.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -20,17 +19,36 @@ VER="${1:-$(git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0-dev)}"
 ZIG="${ZIG:-zig}"
 DIST="dist"
 NAME="Dirtybird-Zig-Miner"
-# x86-64 build flags (AVX2 + SHA-NI baseline). Opt-in PGO via PGO=1 when a local
-# profile exists (CI has none -> plain ReleaseFast; hash output is identical).
-# Pin -Dpgo explicitly (off by default) so release artifacts are deterministic and do
-# not pick up the source build's "use-when-profile-present" default.
-X86="-Dcpu=x86_64_v3+sha -Dpgo=off"
-if [ "${PGO:-0}" = "1" ] && [ -f _pgo/merged.profdata ]; then X86="-Dcpu=x86_64_v3+sha -Dpgo=use"; fi
+# x86-64 build flags: AVX2 + SHA-NI baseline (the SHA-NI asm is comptime-gated on +sha).
+X86="-Dcpu=x86_64_v3+sha"
 
 rm -rf "$DIST" _build
 mkdir -p "$DIST"
 
 stage_common() { cp README.md LICENSE THIRD-PARTY-LICENSES script.sh config.json "$1"/; }
+
+find_readelf() {
+  command -v readelf || command -v llvm-readelf || return 1
+}
+
+verify_bionic_arm64_elf() { # $1 = executable path
+  local bin="$1" readelf_bin tls_align
+  readelf_bin="$(find_readelf)" || {
+    echo "error: readelf or llvm-readelf is required to verify the Android/Termux arm64 binary" >&2
+    return 1
+  }
+
+  if ! "$readelf_bin" -h "$bin" | grep -q 'Type:[[:space:]]*DYN'; then
+    echo "error: $bin is not PIE (ELF Type DYN); Android/Termux will reject it" >&2
+    return 1
+  fi
+
+  tls_align="$("$readelf_bin" -l "$bin" | awk '$1 == "TLS" { getline; print $NF; exit }')"
+  if [ -n "$tls_align" ] && [ "$((tls_align))" -lt 64 ]; then
+    echo "error: $bin has PT_TLS alignment $tls_align; ARM64 Bionic requires at least 0x40" >&2
+    return 1
+  fi
+}
 
 PY="$(command -v python3 || command -v python)"
 zipdir() { # $1 = folder name under $DIST to zip (folder name = archive stem)
@@ -47,6 +65,7 @@ mk_tar() { # $1=archive-name  $2=zig-target  $3=cpu-flags
   "$ZIG" build -Doptimize=ReleaseFast -Dtarget="$2" $3 -p "_build/$name"
   cp "_build/$name/bin/zig-miner" "$d/zig-miner"
   chmod +x "$d/zig-miner"
+  if [ "$2" = "aarch64-linux-musl" ]; then verify_bionic_arm64_elf "$d/zig-miner"; fi
   stage_common "$d"
   cp -r config "$d/config"
   tar -C "$DIST" --mode='u+rwx,go+rx' -czf "$DIST/$name.tar.gz" "$name"
