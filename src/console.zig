@@ -33,25 +33,6 @@ const SYSTEMTIME = extern struct {
 };
 extern "kernel32" fn GetLocalTime(lpSystemTime: *SYSTEMTIME) callconv(.winapi) void;
 
-// POSIX `struct tm` (LP64 glibc/musl ABI: 9 ints + the gmtoff/zone extensions) and
-// localtime_r. Hand-declared because Zig 0.14's std.c exposes neither `tm` nor `localtime_r`.
-// Referenced only in the POSIX branch, so the Windows build prunes them (and never links
-// libc's localtime_r). time_t is `long` (= c_long, 64-bit) on the x86_64/aarch64 targets.
-const CTm = extern struct {
-    tm_sec: c_int,
-    tm_min: c_int,
-    tm_hour: c_int,
-    tm_mday: c_int,
-    tm_mon: c_int,
-    tm_year: c_int,
-    tm_wday: c_int,
-    tm_yday: c_int,
-    tm_isdst: c_int,
-    tm_gmtoff: c_long,
-    tm_zone: ?[*:0]const u8,
-};
-extern "c" fn localtime_r(timer: *const c_long, result: *CTm) ?*CTm;
-
 fn nowLocal() LocalTime {
     if (is_windows) {
         var st: SYSTEMTIME = undefined;
@@ -65,18 +46,22 @@ fn nowLocal() LocalTime {
             .millis = @intCast(st.wMilliseconds),
         };
     } else {
-        // POSIX: localtime_r for the broken-down local fields, milliTimestamp for ms.
-        // libC is linked (build.zig: linkLibC). This branch is pruned on Windows.
+        // POSIX: pure-Zig UTC breakdown via std.time.epoch (no libc localtime_r,
+        // so the miner links no libc on Linux/Android). Timestamps are UTC rather
+        // than local wall-clock -- a deliberate trade for a fully pure-Zig build;
+        // Windows still shows local time via GetLocalTime.
         const ms_total = std.time.milliTimestamp();
-        const t: c_long = @intCast(@divFloor(ms_total, 1000));
-        var tm: CTm = undefined;
-        _ = localtime_r(&t, &tm);
+        const secs: u64 = @intCast(@divFloor(ms_total, 1000));
+        const es = std.time.epoch.EpochSeconds{ .secs = secs };
+        const yd = es.getEpochDay().calculateYearDay();
+        const md = yd.calculateMonthDay();
+        const ds = es.getDaySeconds();
         return .{
-            .month = @intCast(tm.tm_mon + 1),
-            .day = @intCast(tm.tm_mday),
-            .hour = @intCast(tm.tm_hour),
-            .minute = @intCast(tm.tm_min),
-            .second = @intCast(tm.tm_sec),
+            .month = @intFromEnum(md.month),
+            .day = @as(u8, md.day_index) + 1,
+            .hour = ds.getHoursIntoDay(),
+            .minute = ds.getMinutesIntoHour(),
+            .second = ds.getSecondsIntoMinute(),
             .millis = @intCast(@mod(ms_total, 1000)),
         };
     }

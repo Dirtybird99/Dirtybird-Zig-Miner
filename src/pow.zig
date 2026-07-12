@@ -6,19 +6,21 @@ const sha256 = @import("primitives/sha256.zig");
 const salsa20 = @import("primitives/salsa20.zig");
 const fnv1a = @import("primitives/fnv1a.zig");
 const astrobwt = @import("astrobwt.zig");
-const sa = @import("suffix_array.zig");
 const sa_fast = @import("sa_fast.zig");
-const sa_v114 = @import("sa_v114.zig");
+const sa_v114_pure = @import("sa_v114_pure.zig");
 const sha_mb = @import("sha256_mb.zig");
 
 pub const Worker = astrobwt.Worker;
 
-/// Stage-5 SA backend selector for A/B benchmarking. .lib = libsais (exact,
-/// O(n), random-access); .bucket = 2-byte counting + SIMD comparator;
-/// .radix = 8-byte-prefix 4-pass radix. All three are byte-identical (the
-/// SA is unique); they differ only in speed & cache behavior under load.
-const SaBackend = enum { lib, bucket, radix, v114 };
-const SA_BACKEND: SaBackend = .v114;
+/// Stage-5 SA backend selector -- all PURE ZIG (no C/C++ toolchain).
+/// .v114_pure = clean-room descriptor SA (~2.4x libsais, the default);
+/// .bucket = 2-byte counting + SIMD comparator; .radix = 8-byte-prefix radix.
+/// All are byte-identical (the SA is unique); they differ only in speed.
+/// The libsais (.lib) and C++ descriptor (.v114) backends were removed once
+/// .v114_pure was validated -- the differential oracle now lives in the
+/// standalone dev harnesses (src/sa_v114_check.zig), not the shipped miner.
+const SaBackend = enum { bucket, radix, v114_pure };
+const SA_BACKEND: SaBackend = .v114_pure;
 
 /// Run the pipeline through stage 5: fills `w.sa[0..w.data_len]` with the suffix
 /// array. The final SHA-256 over those bytes is done separately by `hash` (single)
@@ -51,17 +53,15 @@ pub fn computeSA(input: []const u8, w: *Worker) !void {
     // vs the C++ oracle over the fuzz corpus). Backend chosen for cache behavior
     // under 10-thread load; the SA is mathematically unique so the hash is identical.
     switch (SA_BACKEND) {
-        .v114 => {
-            // v1.14 descriptor SA (exact, ~2x faster); fall back to libsais if the
-            // descriptor build declines (e.g. degenerate flags).
-            if (!sa_v114.descriptorSA(w)) {
-                if (w.sa_ctx == null) w.sa_ctx = sa.createCtx();
-                try sa.suffixArrayCtx(w.sa_ctx, w.sData[0..w.data_len], w.sa[0..w.data_len]);
+        .v114_pure => {
+            // Pure-Zig clean-room descriptor SA (~2.4x libsais, no C/C++). Falls
+            // back to the pure sa_fast bucket sort if the build declines (only on
+            // degenerate n==0, which never occurs in mining).
+            if (w.sa_pure == null) w.sa_pure = std.heap.page_allocator.create(sa_v114_pure.Scratch) catch return error.OutOfMemory;
+            if (!sa_v114_pure.build(w.sa_pure.?, w.sData[0..].ptr, w.data_len, &w.template_markers, w.n_templates, w.sa[0..].ptr)) {
+                if (w.sa_scratch == null) w.sa_scratch = std.heap.page_allocator.create(sa_fast.Scratch) catch return error.OutOfMemory;
+                sa_fast.bucketSortSA(w.sa_scratch.?, w.sData[0..w.data_len].ptr, w.sa[0..w.data_len].ptr, w.data_len);
             }
-        },
-        .lib => {
-            if (w.sa_ctx == null) w.sa_ctx = sa.createCtx();
-            try sa.suffixArrayCtx(w.sa_ctx, w.sData[0..w.data_len], w.sa[0..w.data_len]);
         },
         .bucket => {
             if (w.sa_scratch == null) w.sa_scratch = std.heap.page_allocator.create(sa_fast.Scratch) catch return error.OutOfMemory;

@@ -11,7 +11,16 @@ const console = @import("console.zig");
 const pages = @import("pages.zig");
 const cpu_features = @import("cpu_features.zig");
 
-const VERSION = "0.1.3";
+const VERSION = "0.2.0";
+
+// aarch64-linux (Android/Termux) TLS-segment alignment anchor. Pure-Zig
+// replacement for src/bionic_tls_align.c: a 64-byte-aligned threadlocal forces
+// the process TLS segment to >=64B alignment, which Android's Bionic loader
+// requires (an under-aligned TLS segment can crash at process start). Only
+// meaningful on aarch64-linux; kept alive by a reference in main() so it isn't
+// stripped (matches the C anchor's `used`/`retain`).
+const bionic_tls_anchor_needed = builtin.target.cpu.arch == .aarch64 and builtin.target.os.tag == .linux;
+threadlocal var bionic_tls_align_anchor: u8 align(64) = 0;
 
 var G: state.MinerState = .{};
 
@@ -376,6 +385,13 @@ fn loadConfig(alloc: std.mem.Allocator, path: []const u8, nthreads: *usize, cfg_
 }
 
 pub fn main() !u8 {
+    // Keep the aarch64-linux TLS-alignment anchor from being stripped.
+    if (bionic_tls_anchor_needed) asm volatile (""
+        :
+        : [p] "r" (&bionic_tls_align_anchor),
+        : "memory"
+    );
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();

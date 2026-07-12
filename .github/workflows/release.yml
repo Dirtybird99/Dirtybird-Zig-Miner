@@ -39,10 +39,9 @@ jobs:
 
       # Cross-compiles every target (Zig needs no per-OS runners): Windows, Linux
       # x86_64 glibc + musl-static, ARM64 musl-static, macOS arm64, and a HiveOS pkg.
-      # PGO=1: the committed _pgo/merged.profdata makes the x86 release binaries
-      # profile-optimized (~10% faster, beats the C miner). Hash output is identical.
+      # The miner is pure Zig (no C/C++, no PGO); ReleaseFast ships on every target.
       - name: Build all platforms + package
-        run: PGO=1 bash scripts/release.sh "${{ steps.ver.outputs.v }}"
+        run: bash scripts/release.sh "${{ steps.ver.outputs.v }}"
 
       - name: Verify checksums
         run: cd dist && sha256sum -c SHA256SUMS.txt

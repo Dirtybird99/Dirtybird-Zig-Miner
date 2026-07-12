@@ -92,7 +92,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     if (want_pie) exe.pie = true;
-    addSaDeps(exe, b, pgo, profile_rt);
+    // The miner is fully pure Zig -- no addSaDeps, no libc/libcpp, no C toolchain.
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -110,10 +110,71 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     if (want_pie) bench.pie = true;
-    addSaDeps(bench, b, pgo, profile_rt);
     b.installArtifact(bench);
     const bench_run = b.addRunArtifact(bench);
     if (b.args) |args| bench_run.addArgs(args);
     const bench_step = b.step("bench", "Run the synthetic hashrate benchmark");
     bench_step.dependOn(&bench_run.step);
+
+    // ---- batched (2-nonce, multi-buffer SHA) hashrate benchmark — the production
+    // path (miner.zig uses pow.hash2). Built from current source with the same
+    // flags/PGO as the miner so its KH/s is the trustworthy baseline.
+    // Usage: zig build bench2 -- <threads> <seconds> <aff 0/1> <affmode>
+    const bench2 = b.addExecutable(.{
+        .name = "bench2",
+        .root_source_file = b.path("src/bench2.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (want_pie) bench2.pie = true;
+    b.installArtifact(bench2);
+    const bench2_run = b.addRunArtifact(bench2);
+    if (b.args) |args| bench2_run.addArgs(args);
+    const bench2_step = b.step("bench2", "Run the batched multi-buffer hashrate benchmark");
+    bench2_step.dependOn(&bench2_run.step);
+
+    // ---- differential harness (`zig build difftest -- gen|check ...`): emit
+    // deterministic inputs, or hash each and compare against `<in> <out>` pairs from a
+    // reference (the C oracle, or a daemon harness). Wired so the fix for the
+    // trailing-zero-strip hash bug can be checked against the real DERO daemon.
+    const difftest = b.addExecutable(.{
+        .name = "difftest",
+        .root_source_file = b.path("src/difftest.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (want_pie) difftest.pie = true;
+    b.installArtifact(difftest);
+    const difftest_run = b.addRunArtifact(difftest);
+    if (b.args) |args| difftest_run.addArgs(args);
+    const difftest_step = b.step("difftest", "Differential fuzz vs a reference (oracle or daemon)");
+    difftest_step.dependOn(&difftest_run.step);
+
+    // ---- unit + parity tests (KAT pow("a"), per-stage + full-pipeline parity).
+    const tests = b.addTest(.{
+        .root_source_file = b.path("src/tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (want_pie) tests.pie = true;
+    addSaDeps(tests, b, pgo, profile_rt);
+    const tests_run = b.addRunArtifact(tests);
+    const test_step = b.step("test", "Run unit + parity tests");
+    test_step.dependOn(&tests_run.step);
+
+    // ---- SA-as-DLL experiment (`zig build sa-dll`): build the descriptor SA as a
+    // Zig-LTO'd shared library so the Rust miner can link the SA exactly as this miner
+    // builds it (clang-19 + PGO + -flto, whole-program-LTO'd by Zig's own lld). addSaDeps
+    // gives it the identical C/C++ compilation; sa_dll.zig re-exports the entry points.
+    // This step is additive — a bare `zig build` still builds only the miner + bench.
+    const sa_dll = b.addSharedLibrary(.{
+        .name = "dero_sa",
+        .root_source_file = b.path("sa_dll.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addSaDeps(sa_dll, b, pgo, profile_rt);
+    const sa_dll_install = b.addInstallArtifact(sa_dll, .{});
+    const sa_dll_step = b.step("sa-dll", "Build the descriptor SA as a Zig-LTO'd DLL (dero_sa.dll)");
+    sa_dll_step.dependOn(&sa_dll_install.step);
 }
