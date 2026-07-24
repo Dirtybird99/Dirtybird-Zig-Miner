@@ -133,6 +133,22 @@ pub fn build(b: *std.Build) void {
     const bench2_step = b.step("bench2", "Run the batched multi-buffer hashrate benchmark");
     bench2_step.dependOn(&bench2_run.step);
 
+    // ---- p95 tail-latency harness (the optimize-loop's metric; frozen ground
+    // truth while a loop is running). Stdout contract: exactly one line
+    // `p95_ns=<N>`. Usage: zig build p95 -- [pin] [repeats] [pairs] [hp]
+    const p95 = b.addExecutable(.{
+        .name = "p95bench",
+        .root_source_file = b.path("src/p95bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (want_pie) p95.pie = true;
+    b.installArtifact(p95);
+    const p95_run = b.addRunArtifact(p95);
+    if (b.args) |args| p95_run.addArgs(args);
+    const p95_step = b.step("p95", "Run the p95 per-hash tail-latency harness");
+    p95_step.dependOn(&p95_run.step);
+
     // ---- differential harness (`zig build difftest -- gen|check ...`): emit
     // deterministic inputs, or hash each and compare against `<in> <out>` pairs from a
     // reference (the C oracle, or a daemon harness). Wired so the fix for the

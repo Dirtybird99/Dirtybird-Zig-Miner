@@ -25,6 +25,10 @@ zig-out/
 _*/
 oracle/build/
 
+# optimize-loop run state (snapshots, ledger, frozen oracle pairs, archived exes)
+sandbox/
+loop.run.yaml
+
 # ...but re-include just the merged PGO profile (the _*/ rule above excludes _pgo/).
 !_pgo/
 _pgo/*
