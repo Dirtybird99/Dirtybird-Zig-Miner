@@ -6,7 +6,10 @@
 //!
 //! This is NOT a transcription of vendor/v114/v114_stubs.cpp -- only the
 //! algorithmic idea is ported; the C++ arena / Stage5Run bit-packing / fused
-//! representation is dropped in favour of plain Zig arrays:
+//! representation was not carried over. (The run descriptor here IS packed
+//! into a u64 for memory bandwidth, but with an independent 24/30/10
+//! key/begin/len layout unrelated to the C++ Stage5Run {key; count<<17|begin}
+//! encoding.) The layout in plain Zig arrays:
 //!
 //!   * The flags partition the full 256-byte chunks into "group-runs" of
 //!     near-identical consecutive chunks. Within a group-run of G chunks the G
@@ -32,7 +35,27 @@ const std = @import("std");
 pub const SCRATCH: usize = 72000 + 64;
 const MAX_GROUP: u32 = 512; // kStage4MaxGroupCount; actual group_count <= data_len>>8
 
-const Run = struct { key: u32, begin: u32, len: u32 };
+// A run packed into one u64 -- 24-bit big-endian 3-byte key in bits [40..63],
+// arena begin in bits [10..39] (begin < SCRATCH < 2^17), length in bits [0..9]
+// (len <= MAX_GROUP = 512). 8 bytes/run instead of a 12-byte struct, so the
+// radix passes and the materialize table walk stream 33% fewer bytes.
+const Run = u64;
+const RUN_KEY_SHIFT: u6 = 40;
+const RUN_BEGIN_SHIFT: u6 = 10;
+const RUN_BEGIN_MASK: u64 = 0x3FFF_FFFF;
+const RUN_LEN_MASK: u64 = 0x3FF;
+
+inline fn packRun(key: u32, begin: u32, len: u32) Run {
+    return (@as(u64, key) << RUN_KEY_SHIFT) | (@as(u64, begin) << RUN_BEGIN_SHIFT) | @as(u64, len);
+}
+
+inline fn runBegin(r: Run) u32 {
+    return @intCast((r >> RUN_BEGIN_SHIFT) & RUN_BEGIN_MASK);
+}
+
+inline fn runLen(r: Run) u32 {
+    return @intCast(r & RUN_LEN_MASK);
+}
 
 /// Per-thread reusable scratch. Allocate once (page_allocator) and reuse.
 pub const Scratch = struct {
@@ -42,32 +65,42 @@ pub const Scratch = struct {
     tmp: [SCRATCH]u32 = undefined, // per-bucket merge buffer
 };
 
-/// 3-pass LSD byte radix sort of `runs` by the 24-bit big-endian key (ascending).
-/// O(runs), replacing a comparison sort that dominated the profile. `tmp` must be
-/// at least runs.len long; result ends up back in `runs`.
+/// 3-pass LSD byte radix sort of `runs` by the 24-bit key in the top field
+/// (ascending; stable, so equal-key runs keep emit order -- the payload bits
+/// below the key never influence the order). All three histograms come from a
+/// single fused counting pass, so the array is walked 4 times instead of 6.
+/// `tmp` must be at least runs.len long; result ends up back in `runs`.
 fn radixSortRuns(runs: []Run, tmp: []Run) void {
-    var src = runs;
-    var dst = tmp[0..runs.len];
-    var shift: u5 = 0;
-    var pass: u32 = 0;
-    while (pass < 3) : (pass += 1) {
-        var count = [_]u32{0} ** 256;
-        for (src) |r| count[(r.key >> shift) & 0xff] += 1;
+    var count = [3][256]u32{ [_]u32{0} ** 256, [_]u32{0} ** 256, [_]u32{0} ** 256 };
+    for (runs) |r| {
+        count[0][(r >> RUN_KEY_SHIFT) & 0xff] += 1;
+        count[1][(r >> (RUN_KEY_SHIFT + 8)) & 0xff] += 1;
+        count[2][(r >> (RUN_KEY_SHIFT + 16)) & 0xff] += 1;
+    }
+    for (&count) |*hist| {
         var sum: u32 = 0;
-        for (&count) |*c| {
+        for (hist) |*c| {
             const cc = c.*;
             c.* = sum;
             sum += cc;
         }
+    }
+    var src = runs;
+    var dst = tmp[0..runs.len];
+    var pass: u32 = 0;
+    while (pass < 3) : (pass += 1) {
+        // Computed per pass: a running `shift += 8` counter would overflow u6
+        // on the (dead) post-final-pass increment (40 -> 48 -> 56 -> 64).
+        const shift: u6 = @intCast(RUN_KEY_SHIFT + 8 * pass);
+        const hist = &count[pass];
         for (src) |r| {
-            const bkt = (r.key >> shift) & 0xff;
-            dst[count[bkt]] = r;
-            count[bkt] += 1;
+            const bkt = (r >> shift) & 0xff;
+            dst[hist[bkt]] = r;
+            hist[bkt] += 1;
         }
         const t = src;
         src = dst;
         dst = t;
-        shift += 8;
     }
     // 3 passes (odd) leave the sorted result in `tmp`; copy back to `runs`.
     if (src.ptr != runs.ptr) @memcpy(runs, src);
@@ -138,11 +171,11 @@ const Builder = struct {
         const begin = self.arena_len;
         @memcpy(self.sc.arena[begin .. begin + positions.len], positions);
         self.arena_len = begin + @as(u32, @intCast(positions.len));
-        self.sc.runs[self.runs_len] = .{
-            .key = keyBE(load24(self.data, positions[0])),
-            .begin = begin,
-            .len = @intCast(positions.len),
-        };
+        self.sc.runs[self.runs_len] = packRun(
+            keyBE(load24(self.data, positions[0])),
+            begin,
+            @intCast(positions.len),
+        );
         self.runs_len += 1;
     }
 
@@ -154,7 +187,7 @@ const Builder = struct {
             const pos = start + rel;
             const begin = self.arena_len;
             self.sc.arena[begin] = pos;
-            self.sc.runs[self.runs_len] = .{ .key = keyBE(load24(self.data, pos)), .begin = begin, .len = 1 };
+            self.sc.runs[self.runs_len] = packRun(keyBE(load24(self.data, pos)), begin, 1);
             self.arena_len = begin + 1;
             self.runs_len += 1;
         }
@@ -208,9 +241,13 @@ const Builder = struct {
 
 /// Build the suffix array of data[0..n) into sa_out[0..n) using the group-run
 /// structure encoded in `flags` ((n>>8)+1 bytes; flags[g]!=0 starts a new
-/// group-run). `data` must be zero-padded >=3 bytes past n-1. Output is the
-/// canonical SA (byte-identical to libsais).
+/// group-run). `data` must be zero-padded >=3 bytes past n-1. `sa_out` must
+/// have capacity for at least n+7 elements (a SCRATCH-sized buffer like
+/// Worker.sa satisfies this): the materialize stage's unconditional 8-wide
+/// stores leave up to 7 scratch lanes past sa_out[n-1] on the final bucket.
+/// sa_out[0..n) is the canonical SA (byte-identical to libsais).
 pub fn buildSA(sc: *Scratch, data: [*]const u8, n: u32, flags: [*]const u8, sa_out: [*]i32) void {
+    std.debug.assert(n + 8 <= SCRATCH); // 8-wide copies need tail slack in every buffer
     var b = Builder{ .sc = sc, .data = data, .ctx = .{ .data = data, .n = n } };
     const full_groups: u32 = n >> 8;
     var order: [MAX_GROUP]u32 = undefined;
@@ -242,21 +279,38 @@ pub fn buildSA(sc: *Scratch, data: [*]const u8, n: u32, flags: [*]const u8, sa_o
     var out_pos: u32 = 0;
     var i: u32 = 0;
     while (i < b.runs_len) {
+        const key_i = sc.runs[i] >> RUN_KEY_SHIFT;
         var j = i + 1;
-        while (j < b.runs_len and sc.runs[j].key == sc.runs[i].key) : (j += 1) {}
+        while (j < b.runs_len and (sc.runs[j] >> RUN_KEY_SHIFT) == key_i) : (j += 1) {}
         if (j == i + 1) {
             const r = sc.runs[i];
-            if (INSTRUMENT) stat_single_pos += r.len;
-            var k: u32 = 0;
-            while (k < r.len) : (k += 1) sa_out[out_pos + k] = @intCast(sc.arena[r.begin + k]);
-            out_pos += r.len;
+            const rl = runLen(r);
+            const rb = runBegin(r);
+            if (INSTRUMENT) stat_single_pos += rl;
+            // One unconditional 8-wide copy covers rl<=8 (the common case,
+            // avg run len ~3.5) with no data-dependent branch; out_pos only
+            // advances by rl, so over-copied lanes are overwritten by the next
+            // run -- except after the FINAL bucket, which leaves up to 7
+            // scratch lanes past sa_out[n-1] (hence the documented n+7
+            // capacity requirement). In-bounds by the >=64-element tail slack
+            // (rb < arena_len <= 72000, out_pos <= n - rl, SCRATCH = 72064).
+            const v: @Vector(8, u32) = sc.arena[rb..][0..8].*;
+            @as([*]u32, @ptrCast(sa_out))[out_pos..][0..8].* = v;
+            var k: u32 = 8;
+            while (k < rl) : (k += 1) sa_out[out_pos + k] = @intCast(sc.arena[rb + k]);
+            out_pos += rl;
         } else {
             var m: u32 = 0;
             var t = i;
             while (t < j) : (t += 1) {
                 const r = sc.runs[t];
-                @memcpy(sc.tmp[m .. m + r.len], sc.arena[r.begin .. r.begin + r.len]);
-                m += r.len;
+                const rl = runLen(r);
+                const rb = runBegin(r);
+                const v: @Vector(8, u32) = sc.arena[rb..][0..8].*;
+                sc.tmp[m..][0..8].* = v;
+                var k: u32 = 8;
+                while (k < rl) : (k += 1) sc.tmp[m + k] = sc.arena[rb + k];
+                m += rl;
             }
             std.sort.pdq(u32, sc.tmp[0..m], b.ctx, SuffixCtx.less);
             if (INSTRUMENT) stat_multi_pos += m;
@@ -295,7 +349,8 @@ pub fn buildStage5Flags(markers: []const u16, n_templates: u32, logical_len: u32
 
 /// Convenience entry: build the stage-5 flags from wolfCompute's per-template
 /// markers, then the SA. Takes explicit params (no astrobwt dependency).
-/// `data` must be zero-padded >=3 bytes past n-1. Returns true on success; false
+/// `data` must be zero-padded >=3 bytes past n-1, and `sa_out` needs n+7
+/// elements of capacity (see buildSA). Returns true on success; false
 /// (degenerate input) => caller should use a fallback backend. n <= 72000 always
 /// keeps flag_len <= 320.
 pub fn build(sc: *Scratch, data: [*]const u8, n: u32, markers: []const u16, n_templates: u32, sa_out: [*]i32) bool {
