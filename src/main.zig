@@ -241,43 +241,127 @@ const RateWindow = struct {
     }
 };
 
-fn formatStatusLine(buf: []u8, stats: ReportStats, tty: bool) []const u8 {
-    return formatStatusLineChecked(buf, stats, tty) catch if (tty) "\r" ++ A_CLREOL else "\n";
+const StatusLayout = enum { full, compact, minimal };
+
+fn terminalColumns() usize {
+    if (builtin.os.tag == .windows) {
+        var info: std.os.windows.CONSOLE_SCREEN_BUFFER_INFO = undefined;
+        if (std.os.windows.kernel32.GetConsoleScreenBufferInfo(std.io.getStdErr().handle, &info) != std.os.windows.FALSE) {
+            const buffer_cols: i32 = @intCast(info.dwSize.X);
+            const window_cols: i32 = @as(i32, @intCast(info.srWindow.Right)) -
+                @as(i32, @intCast(info.srWindow.Left)) + 1;
+            const cols = @min(buffer_cols, window_cols);
+            if (cols > 0) return @intCast(cols);
+        }
+    } else {
+        var size: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
+        const result = std.posix.system.ioctl(
+            std.io.getStdErr().handle,
+            std.posix.T.IOCGWINSZ,
+            @intFromPtr(&size),
+        );
+        if (std.posix.errno(result) == .SUCCESS and size.col > 0) return size.col;
+    }
+    return 40;
 }
 
-fn formatStatusLineChecked(buf: []u8, stats: ReportStats, tty: bool) ![]const u8 {
+fn visibleWidth(line: []const u8) usize {
+    var width: usize = 0;
+    var i: usize = 0;
+    while (i < line.len) {
+        if (line[i] == '\x1b' and i + 1 < line.len and line[i + 1] == '[') {
+            i += 2;
+            while (i < line.len and !(line[i] >= 0x40 and line[i] <= 0x7e)) : (i += 1) {}
+            if (i < line.len) i += 1;
+        } else {
+            if (line[i] >= 0x20) width += 1;
+            i += 1;
+        }
+    }
+    return width;
+}
+
+fn renderStatusLayout(
+    buf: []u8,
+    stats: ReportStats,
+    layout: StatusLayout,
+    include_verbose: bool,
+) ![]const u8 {
     const rejcol = if (stats.rejected > 0) A_BRED else A_WHITE;
     var stream = std.io.fixedBufferStream(buf);
     const writer = stream.writer();
 
-    if (tty) {
-        try writer.print("\r{s}[DIRTYBIRD] ", .{A_BYELLOW});
-        try writer.print("{s}{d:.2} KH/s{s} ({s}{d:.2} KH/s avg{s})", .{
-            A_BGREEN, stats.rate, A_BWHITE, A_GREEN, stats.avg, A_BWHITE,
-        });
-        try writer.print(" | {s}Height:{d}{s}", .{ A_BLUE, stats.height, A_BWHITE });
-        try writer.print(" | {s}Miniblocks:{d}{s}", .{ A_CYAN, stats.accepted, A_BWHITE });
-        try writer.print(" | {s}Blocks:{d}{s}", .{ A_GREEN, stats.blocks, A_BWHITE });
-        try writer.print(" | {s}REJ:{d}{s}", .{ rejcol, stats.rejected, A_BWHITE });
-        try writer.print(" | {s}Diff:{s}{s}", .{ A_MAGENTA, stats.diff, A_BWHITE });
-        try writer.print(" | {s}{d:0>2}:{d:0>2}:{d:0>2}{s}", .{ A_WHITE, stats.hh, stats.mm, stats.ss, A_BWHITE });
-    } else {
-        try writer.print(
-            "[DIRTYBIRD] {d:.2} KH/s ({d:.2} KH/s avg) | Height:{d} | Miniblocks:{d} | Blocks:{d} | REJ:{d} | Diff:{s} | {d:0>2}:{d:0>2}:{d:0>2}",
-            .{ stats.rate, stats.avg, stats.height, stats.accepted, stats.blocks, stats.rejected, stats.diff, stats.hh, stats.mm, stats.ss },
-        );
+    try writer.writeByte('\r');
+    switch (layout) {
+        .full => {
+            try writer.print("{s}[DIRTYBIRD] ", .{A_BYELLOW});
+            try writer.print("{s}{d:.2} KH/s{s} ({s}{d:.2} KH/s avg{s})", .{
+                A_BGREEN, stats.rate, A_BWHITE, A_GREEN, stats.avg, A_BWHITE,
+            });
+            try writer.print(" | {s}Height:{d}{s}", .{ A_BLUE, stats.height, A_BWHITE });
+            try writer.print(" | {s}Miniblocks:{d}{s}", .{ A_CYAN, stats.accepted, A_BWHITE });
+            try writer.print(" | {s}Blocks:{d}{s}", .{ A_GREEN, stats.blocks, A_BWHITE });
+            try writer.print(" | {s}REJ:{d}{s}", .{ rejcol, stats.rejected, A_BWHITE });
+            try writer.print(" | {s}Diff:{s}{s}", .{ A_MAGENTA, stats.diff, A_BWHITE });
+            try writer.print(" | {s}{d:0>2}:{d:0>2}:{d:0>2}{s}", .{ A_WHITE, stats.hh, stats.mm, stats.ss, A_BWHITE });
+        },
+        .compact => {
+            try writer.print("{s}[DIRTYBIRD] {s}{d:.2} KH/s{s}", .{ A_BYELLOW, A_BGREEN, stats.rate, A_BWHITE });
+            try writer.print(" {s}H:{d}{s}", .{ A_BLUE, stats.height, A_BWHITE });
+            try writer.print(" {s}M:{d}{s}", .{ A_CYAN, stats.accepted, A_BWHITE });
+            try writer.print(" {s}B:{d}{s}", .{ A_GREEN, stats.blocks, A_BWHITE });
+            try writer.print(" {s}R:{d}{s}", .{ rejcol, stats.rejected, A_BWHITE });
+        },
+        .minimal => {
+            try writer.print("{s}{d:.2} KH/s{s} {s}H:{d}{s}", .{
+                A_BGREEN, stats.rate, A_BWHITE, A_BLUE, stats.height, A_BWHITE,
+            });
+        },
     }
-    if (stats.verbose) {
+    if (include_verbose) {
         try writer.print(" | funnel submitted:{d} acc:{d} rej:{d} stale:{d} sendfail:{d}", .{
             stats.submitted, stats.accepted, stats.rejected, stats.stale_drops, stats.submit_drops,
         });
     }
-    if (tty) {
-        try writer.print("{s}{s}", .{ A_RESET, A_CLREOL });
-    } else {
-        try writer.writeByte('\n');
-    }
+    try writer.print("{s}{s}", .{ A_RESET, A_CLREOL });
     return stream.getWritten();
+}
+
+fn formatStatusLine(buf: []u8, stats: ReportStats, tty: bool, columns: usize) []const u8 {
+    return formatStatusLineChecked(buf, stats, tty, columns) catch if (tty) "\r" ++ A_CLREOL else "\n";
+}
+
+fn formatStatusLineChecked(buf: []u8, stats: ReportStats, tty: bool, columns: usize) ![]const u8 {
+    if (!tty) {
+        var stream = std.io.fixedBufferStream(buf);
+        const writer = stream.writer();
+        try writer.print(
+            "[DIRTYBIRD] {d:.2} KH/s ({d:.2} KH/s avg) | Height:{d} | Miniblocks:{d} | Blocks:{d} | REJ:{d} | Diff:{s} | {d:0>2}:{d:0>2}:{d:0>2}",
+            .{ stats.rate, stats.avg, stats.height, stats.accepted, stats.blocks, stats.rejected, stats.diff, stats.hh, stats.mm, stats.ss },
+        );
+        if (stats.verbose) {
+            try writer.print(" | funnel submitted:{d} acc:{d} rej:{d} stale:{d} sendfail:{d}", .{
+                stats.submitted, stats.accepted, stats.rejected, stats.stale_drops, stats.submit_drops,
+            });
+        }
+        try writer.writeByte('\n');
+        return stream.getWritten();
+    }
+
+    const budget = if (columns > 0) columns - 1 else 0;
+    for ([_]StatusLayout{ .full, .compact, .minimal }) |layout| {
+        const line = try renderStatusLayout(buf, stats, layout, layout == .full and stats.verbose);
+        if (visibleWidth(line) <= budget) return line;
+        if (layout == .full and stats.verbose) {
+            const without_verbose = try renderStatusLayout(buf, stats, .full, false);
+            if (visibleWidth(without_verbose) <= budget) return without_verbose;
+        }
+    }
+
+    var minimal_buf: [256]u8 = undefined;
+    const minimal = try std.fmt.bufPrint(&minimal_buf, "{d:.2} KH/s H:{d}", .{ stats.rate, stats.height });
+    const clipped = minimal[0..@min(minimal.len, budget)];
+    return std.fmt.bufPrint(buf, "\r{s}{s}", .{ clipped, A_CLREOL });
 }
 
 fn reporter() void {
@@ -324,7 +408,7 @@ fn reporter() void {
             .submitted = G.submitted.load(.monotonic),
             .stale_drops = G.stale_drops.load(.monotonic),
             .submit_drops = G.submit_drops.load(.monotonic),
-        }, g_status_tty);
+        }, g_status_tty, if (g_status_tty) terminalColumns() else 0);
         std.debug.print("{s}", .{line});
     }
 }
@@ -375,12 +459,65 @@ test "formatStatusLine rewrites one colored TTY row" {
         .hh = 0,
         .mm = 0,
         .ss = 5,
-    }, true);
+    }, true, 200);
 
     try std.testing.expect(std.mem.startsWith(u8, line, "\r" ++ A_BYELLOW ++ "[DIRTYBIRD] "));
     try std.testing.expect(std.mem.indexOf(u8, line, "Height:7212998") != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, line, '\n') == null);
     try std.testing.expect(std.mem.endsWith(u8, line, A_RESET ++ A_CLREOL));
+}
+
+test "formatStatusLine selects a layout that fits each terminal width" {
+    const stats = ReportStats{
+        .rate = 23.76,
+        .avg = 20.71,
+        .height = 7212998,
+        .accepted = 1998,
+        .blocks = 262,
+        .rejected = 4,
+        .diff = "312M",
+        .hh = 1,
+        .mm = 2,
+        .ss = 3,
+    };
+
+    for ([_]usize{ 200, 80, 56, 40, 12 }) |columns| {
+        var buf: [512]u8 = undefined;
+        const line = formatStatusLine(&buf, stats, true, columns);
+        try std.testing.expect(visibleWidth(line) <= columns - 1);
+        try std.testing.expect(std.mem.indexOfScalar(u8, line, '\n') == null);
+
+        if (columns == 200) try std.testing.expect(std.mem.indexOf(u8, line, "Height:7212998") != null);
+        if (columns == 80 or columns == 56) {
+            try std.testing.expect(std.mem.indexOf(u8, line, "[DIRTYBIRD]") != null);
+            try std.testing.expect(std.mem.indexOf(u8, line, "M:1998") != null);
+        }
+        if (columns == 40) {
+            try std.testing.expect(std.mem.indexOf(u8, line, "[DIRTYBIRD]") == null);
+            try std.testing.expect(std.mem.indexOf(u8, line, "H:7212998") != null);
+        }
+        if (columns == 12) {
+            try std.testing.expect(std.mem.indexOf(u8, line, A_BGREEN) == null);
+            try std.testing.expect(std.mem.endsWith(u8, line, A_CLREOL));
+        }
+    }
+
+    var long_buf: [512]u8 = undefined;
+    var long_stats = stats;
+    long_stats.accepted = std.math.maxInt(i64);
+    long_stats.blocks = std.math.maxInt(i64);
+    long_stats.rejected = std.math.maxInt(i64);
+    const long_line = formatStatusLine(&long_buf, long_stats, true, 56);
+    try std.testing.expect(visibleWidth(long_line) <= 55);
+    try std.testing.expect(std.mem.indexOf(u8, long_line, "M:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, long_line, "H:7212998") != null);
+
+    var verbose_buf: [512]u8 = undefined;
+    var verbose_stats = stats;
+    verbose_stats.verbose = true;
+    const verbose_line = formatStatusLine(&verbose_buf, verbose_stats, true, 80);
+    try std.testing.expect(visibleWidth(verbose_line) <= 79);
+    try std.testing.expect(std.mem.indexOf(u8, verbose_line, "funnel") == null);
 }
 
 test "formatStatusLine appends verbose counters to the same row" {
@@ -400,7 +537,7 @@ test "formatStatusLine appends verbose counters to the same row" {
         .submitted = 11,
         .stale_drops = 12,
         .submit_drops = 13,
-    }, true);
+    }, true, 200);
 
     try std.testing.expect(std.mem.indexOf(u8, line, " | funnel submitted:11 acc:4 rej:6 stale:12 sendfail:13") != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, line, '\n') == null);
@@ -420,7 +557,7 @@ test "formatStatusLine emits one plain newline record when redirected" {
         .hh = 1,
         .mm = 2,
         .ss = 3,
-    }, false);
+    }, false, 0);
 
     try std.testing.expectEqualStrings(
         "[DIRTYBIRD] 23.76 KH/s (20.71 KH/s avg) | Height:7212998 | Miniblocks:1998 | Blocks:262 | REJ:4 | Diff:312M | 01:02:03\n",
@@ -470,11 +607,117 @@ fn promptLine(buf: []u8) ?[]const u8 {
     return if (t.len == 0) null else t;
 }
 
+const setup_endpoints = [_][]const u8{
+    "community-pools.mysrv.cloud:10300",
+    "dero.rabidmining.com:10300",
+    "dero-node.net:10100",
+    "node.derofoundation.org:10100",
+};
+
+fn validEndpoint(endpoint: []const u8) bool {
+    var host_port = endpoint;
+    if (std.mem.startsWith(u8, host_port, "wss://")) {
+        host_port = host_port["wss://".len..];
+    } else if (std.mem.startsWith(u8, host_port, "ws://")) {
+        host_port = host_port["ws://".len..];
+    } else if (std.mem.indexOf(u8, host_port, "://") != null) {
+        return false;
+    }
+
+    const colon = std.mem.lastIndexOfScalar(u8, host_port, ':') orelse return false;
+    const host = host_port[0..colon];
+    const port_text = host_port[colon + 1 ..];
+    if (host.len == 0 or host.len > 253 or port_text.len == 0 or std.mem.indexOfScalar(u8, host, ':') != null) return false;
+
+    var label_len: usize = 0;
+    var last_was_hyphen = false;
+    for (host) |c| {
+        if (c == '.') {
+            if (label_len == 0 or last_was_hyphen) return false;
+            label_len = 0;
+            last_was_hyphen = false;
+            continue;
+        }
+        if (!std.ascii.isAlphanumeric(c) and c != '-') return false;
+        if (label_len == 0 and c == '-') return false;
+        label_len += 1;
+        if (label_len > 63) return false;
+        last_was_hyphen = c == '-';
+    }
+    if (label_len == 0 or last_was_hyphen) return false;
+
+    const port = std.fmt.parseInt(u32, port_text, 10) catch return false;
+    return port >= 1 and port <= 65535;
+}
+
+fn promptEndpoint(current: []const u8, choice_buf: []u8, custom_buf: []u8) []const u8 {
+    while (true) {
+        std.debug.print(
+            \\
+            \\  Daemon/pool:
+            \\    1. Community Pools (recommended for phones) - community-pools.mysrv.cloud:10300
+            \\    2. Rabid Mining - dero.rabidmining.com:10300
+            \\    3. dero-node.net solo - dero-node.net:10100
+            \\    4. DERO Foundation solo/full-block - node.derofoundation.org:10100
+            \\    5. Custom
+            \\  Pools provide steadier phone-friendly payouts; solo rewards arrive less often.
+            \\  Selection [Enter keeps {s}]:
+        , .{current});
+        const choice = promptLine(choice_buf) orelse return current;
+        const selected = std.fmt.parseInt(u8, choice, 10) catch {
+            std.debug.print("  Invalid selection; choose 1-5.\n", .{});
+            continue;
+        };
+        if (selected >= 1 and selected <= setup_endpoints.len) return setup_endpoints[selected - 1];
+        if (selected != 5) {
+            std.debug.print("  Invalid selection; choose 1-5.\n", .{});
+            continue;
+        }
+        while (true) {
+            std.debug.print("  Custom [ws://|wss://]host:port [Enter keeps {s}]: ", .{current});
+            const custom = promptLine(custom_buf) orelse return current;
+            if (validEndpoint(custom)) return custom;
+            std.debug.print("  Invalid endpoint; use [ws://|wss://]host:port with port 1-65535.\n", .{});
+        }
+    }
+}
+
+test "validEndpoint accepts presets and rejects unsafe custom values" {
+    for (setup_endpoints) |endpoint| try std.testing.expect(validEndpoint(endpoint));
+    try std.testing.expect(validEndpoint("ws://localhost:10100"));
+    try std.testing.expect(validEndpoint("wss://pool.example:65535"));
+
+    for ([_][]const u8{
+        "",
+        "pool.example",
+        "pool.example:0",
+        "pool.example:65536",
+        "pool.example:not-a-port",
+        "http://pool.example:10100",
+        "wss://pool.example:10100/ws",
+        "pool.example:10100?x=1",
+        "pool example:10100",
+        "pool\"example:10100",
+        "pool\\example:10100",
+        ".pool.example:10100",
+        "pool..example:10100",
+        "-pool.example:10100",
+        "pool-.example:10100",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example:10100",
+    }) |endpoint| try std.testing.expect(!validEndpoint(endpoint));
+}
+
 /// Load config `path` (absolute or cwd-relative) and apply daemon/wallet/threads as
 /// defaults; CLI flags parsed afterwards override these. Returns true if the file was
-/// read+parsed. `cfg_threads` receives the raw threads value (for --setup's display).
+/// read+parsed. The raw daemon and threads values are retained for --setup defaults.
 /// A missing/invalid file is non-fatal (returns false).
-fn loadConfig(alloc: std.mem.Allocator, path: []const u8, nthreads: *usize, cfg_threads: *i64) bool {
+fn loadConfig(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    nthreads: *usize,
+    cfg_daemon: *?[]const u8,
+    cfg_threads: *i64,
+) bool {
     const file = (if (std.fs.path.isAbsolute(path))
         std.fs.openFileAbsolute(path, .{})
     else
@@ -486,7 +729,10 @@ fn loadConfig(alloc: std.mem.Allocator, path: []const u8, nthreads: *usize, cfg_
         std.debug.print("warning: could not parse {s}: {s}\n", .{ path, @errorName(e) });
         return false;
     };
-    if (c.daemon_address) |hp| setDaemon(hp);
+    if (c.daemon_address) |hp| {
+        cfg_daemon.* = hp;
+        setDaemon(hp);
+    }
     if (c.wallet) |w| G.wallet = w;
     if (c.threads) |t| {
         cfg_threads.* = t;
@@ -516,6 +762,7 @@ pub fn main() !u8 {
     var do_bench = false;
     var do_setup = false;
     var nthreads: usize = 0;
+    var cfg_daemon: ?[]const u8 = null;
     var cfg_threads: i64 = -1; // raw config threads value (for --setup's "current" display)
 
     // -c/--config-file override, scanned up-front (also consumed in the loop below).
@@ -534,13 +781,13 @@ pub fn main() !u8 {
     {
         var loaded = false;
         if (explicit_cfg) |p| {
-            loaded = loadConfig(alloc, p, &nthreads, &cfg_threads);
+            loaded = loadConfig(alloc, p, &nthreads, &cfg_daemon, &cfg_threads);
         } else {
             if (exeConfigPath(alloc)) |ep| {
                 defer alloc.free(ep);
-                loaded = loadConfig(alloc, ep, &nthreads, &cfg_threads);
+                loaded = loadConfig(alloc, ep, &nthreads, &cfg_daemon, &cfg_threads);
             }
-            if (!loaded) loaded = loadConfig(alloc, "config.json", &nthreads, &cfg_threads);
+            if (!loaded) loaded = loadConfig(alloc, "config.json", &nthreads, &cfg_daemon, &cfg_threads);
         }
         if (!loaded) std.debug.print("config : no config.json found (next to the exe or in the working dir) -- using built-in defaults\n", .{});
     }
@@ -550,6 +797,7 @@ pub fn main() !u8 {
         const a = args[i];
         if (std.mem.eql(u8, a, "-d") and i + 1 < args.len) {
             i += 1;
+            cfg_daemon = args[i];
             setDaemon(args[i]);
         } else if ((std.mem.eql(u8, a, "-c") or std.mem.eql(u8, a, "--config-file")) and i + 1 < args.len) {
             i += 1; // already applied in the config-loading block above
@@ -585,13 +833,15 @@ pub fn main() !u8 {
     // reads), so start.bat and a hand-edited config.json are the one persistent knob.
     if (do_setup) {
         var dbuf: [128]u8 = undefined;
-        const cur_daemon = std.fmt.bufPrint(&dbuf, "{s}:{d}", .{ G.host, G.port }) catch "community-pools.mysrv.cloud:10300";
+        const cur_daemon = cfg_daemon orelse (std.fmt.bufPrint(&dbuf, "{s}{s}:{d}", .{
+            if (G.tls) "" else "ws://", G.host, G.port,
+        }) catch setup_endpoints[0]);
+        var in_choice: [32]u8 = undefined;
         var in_d: [256]u8 = undefined;
         var in_w: [256]u8 = undefined;
         var in_t: [64]u8 = undefined;
         std.debug.print("Setup -- press Enter to keep the current value.\n", .{});
-        std.debug.print("  Daemon/pool host:port [{s}]: ", .{cur_daemon});
-        const daemon = promptLine(&in_d) orelse cur_daemon;
+        const daemon = promptEndpoint(cur_daemon, &in_choice, &in_d);
         std.debug.print("  DERO wallet [{s}]: ", .{G.wallet});
         const wallet = promptLine(&in_w) orelse G.wallet;
         std.debug.print("  Threads (-1 = auto) [{d}]: ", .{cfg_threads});

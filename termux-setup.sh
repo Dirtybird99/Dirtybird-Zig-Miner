@@ -17,7 +17,11 @@ set -euo pipefail
 REPO="Dirtybird99/Dirtybird-Zig-Miner"
 NAME="Dirtybird-Zig-Miner"
 INSTALL_DIR="$HOME/$NAME"
-DEFAULT_ADDR="community-pools.mysrv.cloud:10300"
+COMMUNITY_ADDR="community-pools.mysrv.cloud:10300"
+RABID_ADDR="dero.rabidmining.com:10300"
+DERO_NODE_ADDR="dero-node.net:10100"
+FOUNDATION_ADDR="node.derofoundation.org:10100"
+DEFAULT_ADDR="$COMMUNITY_ADDR"
 
 # ---- pretty output (degrade gracefully when not a tty / NO_COLOR) -------------
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -28,6 +32,60 @@ fi
 info() { printf '%s[*]%s %s\n' "$G" "$Z" "$*"; }
 warn() { printf '%s[!]%s %s\n' "$Y" "$Z" "$*"; }
 die()  { printf '%s[x]%s %s\n' "$R" "$Z" "$*" >&2; exit 1; }
+
+valid_endpoint() {
+  local value="$1" host port label
+  local -a labels
+  if [[ "$value" =~ ^(wss?://)?([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?):([0-9]{1,5})$ ]]; then
+    host="${BASH_REMATCH[2]}"
+    port="${BASH_REMATCH[4]}"
+    [[ "$host" != *..* && "$host" != *.-* && "$host" != *-.* ]] || return 1
+    (( ${#host} <= 253 )) || return 1
+    IFS='.' read -r -a labels <<< "$host"
+    for label in "${labels[@]}"; do (( ${#label} <= 63 )) || return 1; done
+    (( 10#$port >= 1 && 10#$port <= 65535 ))
+  else
+    return 1
+  fi
+}
+
+choose_endpoint() {
+  local current="$1" choice custom
+  while true; do
+    printf '\n%sDaemon/pool%s\n' "$C" "$Z"
+    printf '  1. Community Pools (recommended for phones) - %s\n' "$COMMUNITY_ADDR"
+    printf '  2. Rabid Mining - %s\n' "$RABID_ADDR"
+    printf '  3. dero-node.net solo - %s\n' "$DERO_NODE_ADDR"
+    printf '  4. DERO Foundation solo/full-block - %s\n' "$FOUNDATION_ADDR"
+    printf '  5. Custom\n'
+    printf '  Pools provide steadier phone-friendly payouts; solo rewards arrive less often.\n'
+    read -r -u "$PROMPT_FD" -p "  Selection [Enter keeps $current]: " choice || choice=
+    case "$choice" in
+      "") ADDR="$current"; return ;;
+      1) ADDR="$COMMUNITY_ADDR"; return ;;
+      2) ADDR="$RABID_ADDR"; return ;;
+      3) ADDR="$DERO_NODE_ADDR"; return ;;
+      4) ADDR="$FOUNDATION_ADDR"; return ;;
+      5)
+        while true; do
+          read -r -u "$PROMPT_FD" -p "  Custom [ws://|wss://]host:port [Enter keeps $current]: " custom || custom=
+          [ -n "$custom" ] || { ADDR="$current"; return; }
+          if valid_endpoint "$custom"; then ADDR="$custom"; return; fi
+          warn "Invalid endpoint; use [ws://|wss://]host:port with port 1-65535."
+        done
+        ;;
+      *) warn "Invalid selection; choose 1-5." ;;
+    esac
+  done
+}
+
+json_escape() {
+  local value="$1"
+  [[ ! "$value" =~ [[:cntrl:]] ]] || return 1
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '%s' "$value"
+}
 
 # ---- 1. dependencies ---------------------------------------------------------
 info "Checking Termux dependencies..."
@@ -123,19 +181,20 @@ CUR_ADDR="$(jget 'daemon-address')"; CUR_ADDR="${CUR_ADDR:-$DEFAULT_ADDR}"
 CUR_WALLET="$(jget 'wallet')"
 CUR_THREADS="$(jget 'threads')"; CUR_THREADS="${CUR_THREADS:-$SUGGEST_T}"
 
-if [ -t 0 ]; then
-  printf '\n%sDaemon/pool address%s [scheme://]host:port\n' "$C" "$Z"
-  printf '  Press Enter to use: %s%s%s\n' "$G" "$CUR_ADDR" "$Z"
-  read -rp "  Address: " IN_ADDR || true
-  ADDR="${IN_ADDR:-$CUR_ADDR}"
+PROMPT_FD=0
+if [ ! -t "$PROMPT_FD" ]; then
+  if { exec 3</dev/tty; } 2>/dev/null; then PROMPT_FD=3; fi
+fi
 
+if [ -t "$PROMPT_FD" ]; then
+  choose_endpoint "$CUR_ADDR"
   printf '\n%sDERO wallet address%s (for solo/pool payouts)\n' "$C" "$Z"
   [ -n "$CUR_WALLET" ] && printf '  Press Enter to keep: %s%s%s\n' "$G" "$CUR_WALLET" "$Z"
-  read -rp "  Wallet: " IN_WALLET || true
+  read -r -u "$PROMPT_FD" -p "  Wallet: " IN_WALLET || true
   WALLET="${IN_WALLET:-$CUR_WALLET}"
 
   printf '\n%sThreads%s (%s cores detected, 1 reserved for OS)\n' "$C" "$Z" "$CORES"
-  read -rp "  Threads [${SUGGEST_T}]: " IN_T || true
+  read -r -u "$PROMPT_FD" -p "  Threads [${SUGGEST_T}]: " IN_T || true
   THREADS="${IN_T:-$CUR_THREADS}"
 else
   warn "non-interactive shell -- using existing/default config."
@@ -146,8 +205,10 @@ fi
 case "$THREADS" in ''|*[!0-9]*) THREADS="$SUGGEST_T" ;; esac
 
 # ---- 7. write config.json the miner reads ------------------------------------
+ADDR_JSON="$(json_escape "$ADDR")" || die "endpoint contains unsupported control characters"
+WALLET_JSON="$(json_escape "$WALLET")" || die "wallet contains unsupported control characters"
 printf '{\n  "daemon-address": "%s",\n  "wallet": "%s",\n  "threads": %s\n}\n' \
-  "$ADDR" "$WALLET" "$THREADS" > config.json
+  "$ADDR_JSON" "$WALLET_JSON" "$THREADS" > config.json
 info "Wrote $INSTALL_DIR/config.json (threads: $THREADS, daemon: $ADDR)"
 
 # ---- 8. mine -----------------------------------------------------------------

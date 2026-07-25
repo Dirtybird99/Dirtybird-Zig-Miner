@@ -32,6 +32,8 @@ jobs:
       # runner lacks SHA-NI -- the KAT validates correctness either way.
       - name: Build (ReleaseFast, native)
         run: zig build -Doptimize=ReleaseFast -Dcpu=native
+      - name: Unit and parity tests
+        run: zig build test -Doptimize=ReleaseFast -Dcpu=native
       - name: Self-test (pow(a) KAT)
         shell: bash
         run: |
@@ -71,3 +73,12 @@ jobs:
       - uses: ./.github/actions/setup-zig
       - name: zig fmt --check
         run: zig fmt --check src build.zig
+      - name: Install ShellCheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: Shell syntax and ShellCheck
+        shell: bash
+        run: |
+          while IFS= read -r -d '' script; do
+            bash -n "$script"
+            shellcheck --severity=error "$script"
+          done < <(git ls-files -z '*.sh')
