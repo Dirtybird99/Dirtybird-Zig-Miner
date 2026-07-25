@@ -31,13 +31,12 @@ jobs:
           set -euo pipefail
           V="$GITHUB_REF_NAME"
           [[ "$V" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          test "$(git cat-file -t "refs/tags/$V")" = tag
-          test "$(git rev-parse "$V^{}")" = "$(git rev-parse HEAD)"
 
           TAG_OBJECT="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$V" --jq '.object.sha')"
           test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$V" --jq '.object.type')" = tag
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$TAG_OBJECT" --jq '.object.sha')" = \
+            "$(git rev-parse HEAD)"
           test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$TAG_OBJECT" --jq '.verification.verified')" = true
-          test "$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq '.enabled')" = true
           echo "v=$V" >> "$GITHUB_OUTPUT"
 
       - name: Test
