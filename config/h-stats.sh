@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-. /hive/miners/custom/zig-miner/h-manifest.conf
+. "${HIVE_MANIFEST:-/hive/miners/custom/zig-miner/h-manifest.conf}"
 
 # zig-miner has no HTTP stats API; it prints a live status line to the log via
-# carriage-return (\r) updates in the form:
-#   HHH:MM:SS H:<height> IB:<n> MB:<accepted> MBR:<rejected> SH:<n> Diff:<n> @ <X.XX> KH/s (<Y.YY> avg)
-# We read the tail of the log, turn the \r-overwritten line into newlines, and
-# scrape the freshest values for the HiveOS dashboard.
+# newline records (or carriage-return updates on an interactive terminal):
+#   [DIRTYBIRD] <X.XX> KH/s (<Y.YY> KH/s avg) | Height:<n> |
+#   Miniblocks:<accepted> | Blocks:<n> | REJ:<rejected> | Diff:<n> | HH:MM:SS
+# We scrape the freshest canonical record for the HiveOS dashboard.
 
 LOG="${CUSTOM_LOG_BASENAME}.log"
 
@@ -15,15 +15,12 @@ acc=0
 rej=0
 
 if [[ -f $LOG ]]; then
-    line=$(tail -c 8192 "$LOG" 2>/dev/null | tr '\r' '\n' | grep 'KH/s' | tail -n1)
+    line=$(tail -c 8192 "$LOG" 2>/dev/null | tr '\r' '\n' | grep -F '[DIRTYBIRD]' | tail -n1 | sed $'s/\x1b\\[[0-9;]*[mK]//g')
     if [[ -n $line ]]; then
-        # hashrate: the only token followed by "KH/s" (the avg field has no unit)
-        khs=$(echo "$line" | grep -oE '[0-9]+\.[0-9]+ KH/s' | tail -n1 | grep -oE '[0-9]+\.[0-9]+')
-        # MB: = accepted shares, MBR: = rejected shares (MB: won't match MBR's MB)
-        acc=$(echo "$line" | grep -oE 'MB:[0-9]+' | grep -oE '[0-9]+')
-        rej=$(echo "$line" | grep -oE 'MBR:[0-9]+' | grep -oE '[0-9]+')
-        # leading HHH:MM:SS elapsed -> uptime in seconds
-        hms=$(echo "$line" | grep -oE '^[0-9]{3}:[0-9]{2}:[0-9]{2}')
+        khs=$(echo "$line" | grep -oE '[0-9]+(\.[0-9]+)? KH/s' | head -n1 | grep -oE '^[0-9]+(\.[0-9]+)?')
+        acc=$(echo "$line" | grep -oE 'Miniblocks:[0-9]+' | head -n1 | grep -oE '[0-9]+')
+        rej=$(echo "$line" | grep -oE 'REJ:[0-9]+' | head -n1 | grep -oE '[0-9]+')
+        hms=$(echo "$line" | grep -oE '[0-9]+:[0-9]{2}:[0-9]{2}' | tail -n1)
         if [[ -n $hms ]]; then
             h=${hms%%:*}; rest=${hms#*:}; m=${rest%%:*}; s=${rest#*:}
             uptime=$(( 10#$h * 3600 + 10#$m * 60 + 10#$s ))

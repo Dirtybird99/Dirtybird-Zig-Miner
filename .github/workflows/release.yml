@@ -3,11 +3,6 @@ name: Release
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version/tag to build and publish (e.g. v0.1.0)"
-        required: true
 
 permissions:
   contents: write
@@ -22,20 +17,33 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
 
       - uses: ./.github/actions/setup-zig
 
-      - name: Resolve version
+      - name: Verify annotated signed release tag
         id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "v=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "v=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          fi
+          set -euo pipefail
+          V="$GITHUB_REF_NAME"
+          [[ "$V" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git cat-file -t "refs/tags/$V")" = tag
+          test "$(git rev-parse "$V^{}")" = "$(git rev-parse HEAD)"
+
+          TAG_OBJECT="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$V" --jq '.object.sha')"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$V" --jq '.object.type')" = tag
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$TAG_OBJECT" --jq '.verification.verified')" = true
+          test "$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq '.enabled')" = true
+          echo "v=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Test
+        run: |
+          zig build -Dversion="${GITHUB_REF_NAME#v}" test
+          bash config/test-h-stats.sh
 
       # Cross-compiles every target (Zig needs no per-OS runners): Windows, Linux
       # x86_64 glibc + musl-static, ARM64 musl-static, macOS arm64, and a HiveOS pkg.
@@ -46,15 +54,41 @@ jobs:
       - name: Verify checksums
         run: cd dist && sha256sum -c SHA256SUMS.txt
 
-      - name: Publish to GitHub Release
+      - name: Smoke-test packaged Linux and HiveOS artifacts
+        run: |
+          set -euo pipefail
+          V="${{ steps.ver.outputs.v }}"
+          VERSION="${V#v}"
+          mkdir smoke
+          tar -xzf "dist/Dirtybird-Zig-Miner-amd64-$V.tar.gz" -C smoke
+          BIN="smoke/Dirtybird-Zig-Miner-amd64-$V/zig-miner"
+          test "$("$BIN" --version 2>&1)" = "zig-miner v$VERSION"
+          "$BIN" --selftest
+          test "$(tar -xOf "dist/dirtybird-zig-miner-$V.hiveos_mmpos.amd64.tar.gz" zig-miner/h-manifest.conf | sed -n 's/^CUSTOM_VERSION=//p')" = "$VERSION"
+
+      - name: Publish immutable-ready GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           V="${{ steps.ver.outputs.v }}"
           ASSETS=(dist/*.zip dist/*.tar.gz dist/SHA256SUMS.txt)
           if gh release view "$V" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$V" "${ASSETS[@]}" --repo "$GITHUB_REPOSITORY" --clobber
-          else
-            gh release create "$V" "${ASSETS[@]}" --repo "$GITHUB_REPOSITORY" \
-              --title "Dirtybird Zig Miner $V" --generate-notes
+            echo "error: release $V already exists; published assets are never overwritten" >&2
+            exit 1
           fi
+          gh release create "$V" "${ASSETS[@]}" --repo "$GITHUB_REPOSITORY" \
+            --title "Dirtybird Zig Miner $V" --generate-notes --verify-tag
+          test "$(gh release view "$V" --repo "$GITHUB_REPOSITORY" \
+            --json isImmutable --jq '.isImmutable')" = true
+          for attempt in 1 2 3; do
+            ok=true
+            gh release verify "$V" --repo "$GITHUB_REPOSITORY" || ok=false
+            for asset in "${ASSETS[@]}"; do
+              gh release verify-asset "$V" "$asset" \
+                --repo "$GITHUB_REPOSITORY" || ok=false
+            done
+            $ok && exit 0
+            sleep 5
+          done
+          exit 1

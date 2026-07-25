@@ -52,6 +52,9 @@ pub fn build(b: *std.Build) void {
     // hosts (the legacy-SSE SHA path that beats `native`), and PGO when a local profile
     // exists. All overridable via -Doptimize / -Dtarget / -Dcpu / -Dpgo.
     const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Optimization mode (default: ReleaseFast)") orelse .ReleaseFast;
+    const version = b.option([]const u8, "version", "Version embedded in zig-miner (release builds set this from the tag)") orelse "dev";
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
 
     var default_query: std.Target.Query = .{};
     if (builtin.target.cpu.arch == .x86_64) default_query = .{
@@ -92,6 +95,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     if (want_pie) exe.pie = true;
+    exe.root_module.addOptions("build_options", build_options);
     // The miner is fully pure Zig -- no addSaDeps, no libc/libcpp, no C toolchain.
     b.installArtifact(exe);
 
@@ -173,6 +177,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     if (want_pie) tests.pie = true;
+    tests.root_module.addOptions("build_options", build_options);
     addSaDeps(tests, b, pgo, profile_rt);
     const tests_run = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit + parity tests");
