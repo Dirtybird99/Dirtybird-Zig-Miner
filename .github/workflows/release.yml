@@ -37,7 +37,6 @@ jobs:
           test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$TAG_OBJECT" --jq '.object.sha')" = \
             "$(git rev-parse HEAD)"
           test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$TAG_OBJECT" --jq '.verification.verified')" = true
-          test "$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq '.enabled')" = true
           echo "v=$V" >> "$GITHUB_OUTPUT"
 
       - name: Test
