@@ -46,6 +46,8 @@ curl -fsSL https://raw.githubusercontent.com/Dirtybird99/Dirtybird-Zig-Miner/mai
 
 The arm64 binary is built **PIE** (`ET_DYN`) so Android's loader accepts it — older non-PIE builds failed with `error: "...zig-miner" has unexpected e_type: 2`. Run the miner from `$HOME` (or `$PREFIX`), not `/sdcard`, which is mounted `noexec`. The installer handles both automatically.
 
+The setup menu includes Community Pools, Rabid Mining, dero-node.net solo, the DERO Foundation solo/full-block node, and a custom endpoint. A pool is the phone-friendly choice because payouts arrive more steadily; solo/full-block mining can go much longer between rewards.
+
 ## Algorithm (AstroBWTv3)
 
 ```
@@ -105,7 +107,7 @@ Two equivalent ways to set your pool / wallet / threads, **both persisting to th
      "threads": -1
    }
    ```
-2. **Interactively** — run `zig-miner --setup` (or **`start.bat`** / `./script.sh` and answer `y`). It prompts for each value (Enter keeps the current one) and writes `config.json`.
+2. **Interactively** — run `zig-miner --setup` (or **`start.bat`** / `./script.sh` and answer `y`). Choose a preset or validated custom `[ws://|wss://]host:port`; Enter keeps the current endpoint. It then prompts for wallet and threads and writes `config.json`.
 
 Then start it:
 
