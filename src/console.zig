@@ -8,13 +8,17 @@
 //!   ts = strftime("%d/%m %H:%M:%S", localtime), clr_eol = "\x1b[K".
 //! The C writes to stdout; we use stderr (std.debug.print) to share the one stream --
 //! and lock -- the reporter already uses (main.zig). Visually identical.
-//! The Zig miner forces the leading CR+clear sequence for every log line so a later
-//! INFO/WARN/ERROR line never lands in the middle of the live status banner.
+//! Interactive logs clear the live status row; redirected logs stay plain.
 const std = @import("std");
 const builtin = @import("builtin");
 
 const is_windows = builtin.os.tag == .windows;
 const A_CLREOL = "\x1b[K"; // ANSI erase-to-end-of-line (C's dluna_clr_eol)
+var is_tty = false;
+
+pub fn setTty(value: bool) void {
+    is_tty = value;
+}
 
 /// Broken-down LOCAL wall-clock time to the millisecond (C: localtime + .%03d ms).
 const LocalTime = struct { month: u8, day: u8, hour: u8, minute: u8, second: u8, millis: u16 };
@@ -67,13 +71,13 @@ fn nowLocal() LocalTime {
     }
 }
 
-fn formatLogLine(buf: []u8, lt: LocalTime, level: []const u8, msg: []const u8) []const u8 {
+fn formatLogLine(buf: []u8, lt: LocalTime, level: []const u8, msg: []const u8, tty: bool) []const u8 {
     var lvl: [5]u8 = .{ ' ', ' ', ' ', ' ', ' ' };
     const n = @min(level.len, lvl.len);
     @memcpy(lvl[0..n], level[0..n]);
 
-    return std.fmt.bufPrint(buf, "\r{s}{d:0>2}/{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}  {s} {s}\n", .{
-        A_CLREOL, lt.day, lt.month, lt.hour, lt.minute, lt.second, lt.millis, lvl[0..], msg,
+    return std.fmt.bufPrint(buf, "{s}{d:0>2}/{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}  {s} {s}\n", .{
+        if (tty) "\r" ++ A_CLREOL else "", lt.day, lt.month, lt.hour, lt.minute, lt.second, lt.millis, lvl[0..], msg,
     }) catch buf[0..0];
 }
 
@@ -83,7 +87,7 @@ fn formatLogLine(buf: []u8, lt: LocalTime, level: []const u8, msg: []const u8) [
 pub fn logLineRaw(level: []const u8, msg: []const u8) void {
     const lt = nowLocal();
     var buf: [1024]u8 = undefined;
-    std.debug.print("{s}", .{formatLogLine(&buf, lt, level, msg)});
+    std.debug.print("{s}", .{formatLogLine(&buf, lt, level, msg, is_tty)});
 }
 
 /// Convenience for callers with a comptime format (the startup banner). Formats into a
@@ -103,7 +107,17 @@ test "formatLogLine clears any live status row before logging" {
         .minute = 27,
         .second = 12,
         .millis = 466,
-    }, "INFO", "Connected");
+    }, "INFO", "Connected", true);
 
     try std.testing.expectEqualStrings("\r\x1b[K19/06 13:27:12.466  INFO  Connected\n", line);
+
+    const plain = formatLogLine(&buf, .{
+        .month = 6,
+        .day = 19,
+        .hour = 13,
+        .minute = 27,
+        .second = 12,
+        .millis = 466,
+    }, "INFO", "Connected", false);
+    try std.testing.expectEqualStrings("19/06 13:27:12.466  INFO  Connected\n", plain);
 }

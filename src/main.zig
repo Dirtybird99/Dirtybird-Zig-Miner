@@ -10,8 +10,9 @@ const config = @import("config.zig");
 const console = @import("console.zig");
 const pages = @import("pages.zig");
 const cpu_features = @import("cpu_features.zig");
+const build_options = @import("build_options");
 
-const VERSION = "0.2.0";
+const VERSION = build_options.version;
 
 // aarch64-linux (Android/Termux) TLS-segment alignment anchor. Pure-Zig
 // replacement for src/bionic_tls_align.c: a 64-byte-aligned threadlocal forces
@@ -156,9 +157,9 @@ fn bench(alloc: std.mem.Allocator) !u8 {
 }
 
 var g_verbose = false;
+var g_status_tty = false;
 
-// ANSI SGR colors matching the C miner (dirtybird-miner src/main.cpp). The reporter
-// forces the colored in-place banner even when stderr is not detected as a TTY.
+// ANSI SGR colors matching the C miner (dirtybird-miner src/main.cpp).
 const A_RESET = "\x1b[0m";
 const A_CLREOL = "\x1b[K";
 const A_BYELLOW = "\x1b[93m";
@@ -196,50 +197,106 @@ const ReportStats = struct {
     submit_drops: i64 = 0,
 };
 
-fn formatStatusLine(buf: []u8, stats: ReportStats) []const u8 {
-    return formatStatusLineChecked(buf, stats) catch "\r" ++ A_CLREOL;
+const rate_window_slots = 10;
+
+const HashrateSnapshot = struct {
+    elapsed_ns: u64,
+    hashes: i64,
+};
+
+const RateWindow = struct {
+    points: [rate_window_slots]HashrateSnapshot,
+    next: usize = 0,
+    start: HashrateSnapshot,
+    last: HashrateSnapshot,
+
+    fn init(elapsed_ns: u64, hashes: i64) RateWindow {
+        const snapshot = HashrateSnapshot{ .elapsed_ns = elapsed_ns, .hashes = hashes };
+        return .{
+            .points = .{snapshot} ** rate_window_slots,
+            .start = snapshot,
+            .last = snapshot,
+        };
+    }
+
+    fn rateBetween(newer: HashrateSnapshot, older: HashrateSnapshot) f64 {
+        if (newer.elapsed_ns <= older.elapsed_ns or newer.hashes < older.hashes) return 0;
+        const elapsed_s = @as(f64, @floatFromInt(newer.elapsed_ns - older.elapsed_ns)) /
+            @as(f64, std.time.ns_per_s);
+        return @as(f64, @floatFromInt(newer.hashes - older.hashes)) / elapsed_s / 1000.0;
+    }
+
+    fn sample(self: *RateWindow, elapsed_ns: u64, hashes: i64) f64 {
+        const current = HashrateSnapshot{ .elapsed_ns = elapsed_ns, .hashes = hashes };
+        if (current.elapsed_ns <= self.last.elapsed_ns or current.hashes < self.last.hashes) return 0;
+        const old = self.points[self.next];
+        self.points[self.next] = current;
+        self.next = (self.next + 1) % self.points.len;
+        self.last = current;
+        return rateBetween(current, old);
+    }
+
+    fn average(self: *const RateWindow, elapsed_ns: u64, hashes: i64) f64 {
+        return rateBetween(.{ .elapsed_ns = elapsed_ns, .hashes = hashes }, self.start);
+    }
+};
+
+fn formatStatusLine(buf: []u8, stats: ReportStats, tty: bool) []const u8 {
+    return formatStatusLineChecked(buf, stats, tty) catch if (tty) "\r" ++ A_CLREOL else "\n";
 }
 
-fn formatStatusLineChecked(buf: []u8, stats: ReportStats) ![]const u8 {
+fn formatStatusLineChecked(buf: []u8, stats: ReportStats, tty: bool) ![]const u8 {
     const rejcol = if (stats.rejected > 0) A_BRED else A_WHITE;
     var stream = std.io.fixedBufferStream(buf);
     const writer = stream.writer();
 
-    try writer.print("\r{s}[DIRTYBIRD] ", .{A_BYELLOW});
-    try writer.print("{s}{d:.2} KH/s{s} ({s}{d:.2} KH/s avg{s})", .{
-        A_BGREEN, stats.rate, A_BWHITE, A_GREEN, stats.avg, A_BWHITE,
-    });
-    try writer.print(" | {s}Height:{d}{s}", .{ A_BLUE, stats.height, A_BWHITE });
-    try writer.print(" | {s}Miniblocks:{d}{s}", .{ A_CYAN, stats.accepted, A_BWHITE });
-    try writer.print(" | {s}Blocks:{d}{s}", .{ A_GREEN, stats.blocks, A_BWHITE });
-    try writer.print(" | {s}REJ:{d}{s}", .{ rejcol, stats.rejected, A_BWHITE });
-    try writer.print(" | {s}Diff:{s}{s}", .{ A_MAGENTA, stats.diff, A_BWHITE });
-    try writer.print(" | {s}{d:0>2}:{d:0>2}:{d:0>2}{s}", .{ A_WHITE, stats.hh, stats.mm, stats.ss, A_BWHITE });
+    if (tty) {
+        try writer.print("\r{s}[DIRTYBIRD] ", .{A_BYELLOW});
+        try writer.print("{s}{d:.2} KH/s{s} ({s}{d:.2} KH/s avg{s})", .{
+            A_BGREEN, stats.rate, A_BWHITE, A_GREEN, stats.avg, A_BWHITE,
+        });
+        try writer.print(" | {s}Height:{d}{s}", .{ A_BLUE, stats.height, A_BWHITE });
+        try writer.print(" | {s}Miniblocks:{d}{s}", .{ A_CYAN, stats.accepted, A_BWHITE });
+        try writer.print(" | {s}Blocks:{d}{s}", .{ A_GREEN, stats.blocks, A_BWHITE });
+        try writer.print(" | {s}REJ:{d}{s}", .{ rejcol, stats.rejected, A_BWHITE });
+        try writer.print(" | {s}Diff:{s}{s}", .{ A_MAGENTA, stats.diff, A_BWHITE });
+        try writer.print(" | {s}{d:0>2}:{d:0>2}:{d:0>2}{s}", .{ A_WHITE, stats.hh, stats.mm, stats.ss, A_BWHITE });
+    } else {
+        try writer.print(
+            "[DIRTYBIRD] {d:.2} KH/s ({d:.2} KH/s avg) | Height:{d} | Miniblocks:{d} | Blocks:{d} | REJ:{d} | Diff:{s} | {d:0>2}:{d:0>2}:{d:0>2}",
+            .{ stats.rate, stats.avg, stats.height, stats.accepted, stats.blocks, stats.rejected, stats.diff, stats.hh, stats.mm, stats.ss },
+        );
+    }
     if (stats.verbose) {
         try writer.print(" | funnel submitted:{d} acc:{d} rej:{d} stale:{d} sendfail:{d}", .{
             stats.submitted, stats.accepted, stats.rejected, stats.stale_drops, stats.submit_drops,
         });
     }
-    try writer.print("{s}{s}", .{ A_RESET, A_CLREOL });
+    if (tty) {
+        try writer.print("{s}{s}", .{ A_RESET, A_CLREOL });
+    } else {
+        try writer.writeByte('\n');
+    }
     return stream.getWritten();
 }
 
 fn reporter() void {
-    var prev: i64 = 0;
-    const t0 = std.time.milliTimestamp();
-    var prev_t = t0;
+    var timer = std.time.Timer.start() catch |err| {
+        console.logLine("ERROR", "status timer initialization failed: {s}", .{@errorName(err)});
+        G.quit.store(true, .monotonic);
+        return;
+    };
+    const start_hashes = G.total_hashes.load(.monotonic);
+    const start_ns = timer.read();
+    var rates = RateWindow.init(start_ns, start_hashes);
     while (!G.quit.load(.monotonic)) {
         std.time.sleep(std.time.ns_per_s);
-        const now = std.time.milliTimestamp();
-        const dt = @as(f64, @floatFromInt(now - prev_t)) / 1000.0;
-        const elapsed = @as(f64, @floatFromInt(now - t0)) / 1000.0;
-        prev_t = now;
+        const now_ns = timer.read();
+        const elapsed_ns = now_ns - start_ns;
         const total = G.total_hashes.load(.monotonic);
-        const delta = total - prev;
-        prev = total;
-        const rate = if (dt > 0) @as(f64, @floatFromInt(delta)) / (dt * 1000.0) else 0;
-        const avg = if (elapsed > 0) @as(f64, @floatFromInt(total)) / (elapsed * 1000.0) else 0;
-        const sec: u64 = @intFromFloat(elapsed);
+        const rate = rates.sample(now_ns, total);
+        const avg = rates.average(now_ns, total);
+        const sec: u64 = elapsed_ns / std.time.ns_per_s;
         const hh = sec / 3600;
         const mm = (sec % 3600) / 60;
         const ss = sec % 60;
@@ -267,12 +324,45 @@ fn reporter() void {
             .submitted = G.submitted.load(.monotonic),
             .stale_drops = G.stale_drops.load(.monotonic),
             .submit_drops = G.submit_drops.load(.monotonic),
-        });
+        }, g_status_tty);
         std.debug.print("{s}", .{line});
     }
 }
 
-test "formatStatusLine always rewrites one colored status row" {
+test "RateWindow uses reporter baseline, real elapsed time, and ten samples" {
+    const second = std.time.ns_per_s;
+
+    var nonzero = RateWindow.init(0, 5_000);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), nonzero.sample(second, 6_000), 0.000_001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), nonzero.average(second, 6_000), 0.000_001);
+
+    var irregular = RateWindow.init(0, 0);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), irregular.sample(second + second / 4, 1_250), 0.000_001);
+    try std.testing.expectEqual(@as(f64, 0), irregular.sample(second, 1_500));
+    try std.testing.expectEqual(@as(f64, 0), irregular.sample(2 * second, 1_000));
+
+    var steady = RateWindow.init(0, 0);
+    var tick: u64 = 1;
+    while (tick <= 11) : (tick += 1) {
+        try std.testing.expectApproxEqAbs(
+            @as(f64, 1.0),
+            steady.sample(tick * second, @intCast(tick * 1_000)),
+            0.000_001,
+        );
+    }
+}
+
+test "RateWindow decays to zero after ten idle samples" {
+    const second = std.time.ns_per_s;
+    var rates = RateWindow.init(0, 0);
+    var tick: u64 = 1;
+    while (tick <= 5) : (tick += 1) _ = rates.sample(tick * second, @intCast(tick * 1_000));
+    while (tick < 15) : (tick += 1) _ = rates.sample(tick * second, 5_000);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), rates.sample(15 * second, 5_000), 0.000_001);
+    try std.testing.expectApproxEqAbs(1.0 / 3.0, rates.average(15 * second, 5_000), 0.000_001);
+}
+
+test "formatStatusLine rewrites one colored TTY row" {
     var buf: [512]u8 = undefined;
     const line = formatStatusLine(&buf, .{
         .rate = 23.76,
@@ -285,7 +375,7 @@ test "formatStatusLine always rewrites one colored status row" {
         .hh = 0,
         .mm = 0,
         .ss = 5,
-    });
+    }, true);
 
     try std.testing.expect(std.mem.startsWith(u8, line, "\r" ++ A_BYELLOW ++ "[DIRTYBIRD] "));
     try std.testing.expect(std.mem.indexOf(u8, line, "Height:7212998") != null);
@@ -310,11 +400,34 @@ test "formatStatusLine appends verbose counters to the same row" {
         .submitted = 11,
         .stale_drops = 12,
         .submit_drops = 13,
-    });
+    }, true);
 
     try std.testing.expect(std.mem.indexOf(u8, line, " | funnel submitted:11 acc:4 rej:6 stale:12 sendfail:13") != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, line, '\n') == null);
     try std.testing.expect(std.mem.endsWith(u8, line, A_RESET ++ A_CLREOL));
+}
+
+test "formatStatusLine emits one plain newline record when redirected" {
+    var buf: [512]u8 = undefined;
+    const line = formatStatusLine(&buf, .{
+        .rate = 23.76,
+        .avg = 20.71,
+        .height = 7212998,
+        .accepted = 1998,
+        .blocks = 262,
+        .rejected = 4,
+        .diff = "312M",
+        .hh = 1,
+        .mm = 2,
+        .ss = 3,
+    }, false);
+
+    try std.testing.expectEqualStrings(
+        "[DIRTYBIRD] 23.76 KH/s (20.71 KH/s avg) | Height:7212998 | Miniblocks:1998 | Blocks:262 | REJ:4 | Diff:312M | 01:02:03\n",
+        line,
+    );
+    try std.testing.expect(std.mem.indexOfScalar(u8, line, '\r') == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, line, '\x1b') == null);
 }
 
 /// Parse "[wss://|ws://]host:port" into G.host/G.port and pick the transport (G.tls).
@@ -518,6 +631,13 @@ pub fn main() !u8 {
     if (nthreads == 0) nthreads = std.Thread.getCpuCount() catch 4;
     G.nthreads = nthreads;
 
+    if (builtin.os.tag == .windows) {
+        g_status_tty = std.io.getStdErr().isTty() and system.enableVirtualTerminal();
+    } else {
+        g_status_tty = std.io.getStdErr().isTty();
+    }
+    console.setTty(g_status_tty);
+
     // Startup banner -- timestamped INFO lines matching the Dirtybird C miner.
     console.logLine("INFO", "Dirtybird Miner", .{});
     console.logLine("INFO", "Server:  {s}://{s}:{d}", .{ if (G.tls) "wss" else "ws", G.host, G.port });
@@ -542,7 +662,6 @@ pub fn main() !u8 {
     if (builtin.os.tag == .windows) {
         _ = system.enableLockMemoryPrivilege();
         system.setProcessHighPriority();
-        system.enableVirtualTerminal(); // ANSI colors for the status line
     }
 
     // Mining-thread workers: TWO per thread (one per lane of the batched, 2-way

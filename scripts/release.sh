@@ -2,8 +2,7 @@
 #
 # Dirtybird Zig Miner -- build all release binaries + packages into dist/.
 #
-# Usage:  scripts/release.sh [version]
-#   version defaults to the latest git tag, else v0.0.0-dev.
+# Usage:  scripts/release.sh vX.Y.Z
 #   Override the Zig binary with ZIG=/path/to/zig.
 #
 # Produces, for each platform, an archive containing the binary plus README,
@@ -15,7 +14,18 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VER="${1:-$(git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0-dev)}"
+if [[ $# -ne 1 || ! $1 =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "usage: scripts/release.sh vX.Y.Z" >&2
+  exit 2
+fi
+VER="$1"
+VERSION="${VER#v}"
+ZON_VERSION="$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' build.zig.zon)"
+MANIFEST_VERSION="$(sed -n 's/^CUSTOM_VERSION=//p' config/h-manifest.conf)"
+if [[ $ZON_VERSION != "$VERSION" || $MANIFEST_VERSION != "$VERSION" ]]; then
+  echo "error: tag $VER, build.zig.zon ($ZON_VERSION), and Hive manifest ($MANIFEST_VERSION) must match" >&2
+  exit 1
+fi
 ZIG="${ZIG:-zig}"
 DIST="dist"
 NAME="Dirtybird-Zig-Miner"
@@ -62,7 +72,7 @@ PY
 mk_tar() { # $1=archive-name  $2=zig-target  $3=cpu-flags
   local name="$1" d="$DIST/$1"
   mkdir -p "$d"
-  "$ZIG" build -Doptimize=ReleaseFast -Dtarget="$2" $3 -p "_build/$name"
+  "$ZIG" build -Dversion="$VERSION" -Doptimize=ReleaseFast -Dtarget="$2" $3 -p "_build/$name"
   cp "_build/$name/bin/zig-miner" "$d/zig-miner"
   chmod +x "$d/zig-miner"
   if [ "$2" = "aarch64-linux-musl" ]; then verify_bionic_arm64_elf "$d/zig-miner"; fi
@@ -78,7 +88,7 @@ mk_tar "${NAME}-arm64-${VER}"       aarch64-linux-musl ""
 mk_tar "${NAME}-macos-arm64-${VER}" aarch64-macos      ""
 
 # ---- Windows zip -------------------------------------------------------------
-"$ZIG" build -Doptimize=ReleaseFast -Dtarget=x86_64-windows-gnu $X86 -p _build/win
+"$ZIG" build -Dversion="$VERSION" -Doptimize=ReleaseFast -Dtarget=x86_64-windows-gnu $X86 -p _build/win
 wd="$DIST/${NAME}-win64-${VER}"
 mkdir -p "$wd"
 cp _build/win/bin/zig-miner.exe "$wd/"
@@ -91,8 +101,9 @@ rm -rf "$wd"
 hd="$DIST/hive/zig-miner"
 mkdir -p "$hd"
 cp config/h-manifest.conf config/h-run.sh config/h-config.sh config/h-stats.sh README.md LICENSE "$hd/"
-"$ZIG" build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl $X86 -p _build/hive
+"$ZIG" build -Dversion="$VERSION" -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl $X86 -p _build/hive
 cp _build/hive/bin/zig-miner "$hd/zig-miner"
+sed -i "s/^CUSTOM_VERSION=.*/CUSTOM_VERSION=$VERSION/" "$hd/h-manifest.conf"
 chmod +x "$hd/zig-miner" "$hd"/*.sh
 tar -C "$DIST/hive" --mode='u+rwx,go+rx' -czf "$DIST/dirtybird-zig-miner-${VER}.hiveos_mmpos.amd64.tar.gz" zig-miner
 rm -rf "$DIST/hive"
@@ -100,14 +111,6 @@ rm -rf "$DIST/hive"
 # ---- checksums ---------------------------------------------------------------
 ( cd "$DIST" && sha256sum *.zip *.tar.gz > SHA256SUMS.txt )
 rm -rf _build
-
-# ---- mirror archives into the repo tree (browsable releases/<version>/) -------
-# DeroLuna-style: the same archives that go on the Release page also live in-tree.
-# (git add releases/<version> && commit to publish them.)
-REL="releases/$VER"
-mkdir -p "$REL"
-cp "$DIST"/*.zip "$DIST"/*.tar.gz "$DIST/SHA256SUMS.txt" "$REL"/
-echo "mirrored archives into $REL/"
 
 echo "=== built into $DIST/ ==="
 ls -1 "$DIST"
