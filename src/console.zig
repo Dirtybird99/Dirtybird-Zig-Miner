@@ -11,6 +11,7 @@
 //! Interactive logs clear the live status row; redirected logs stay plain.
 const std = @import("std");
 const builtin = @import("builtin");
+const tz = @import("tz.zig");
 
 const is_windows = builtin.os.tag == .windows;
 const A_CLREOL = "\x1b[K"; // ANSI erase-to-end-of-line (C's dluna_clr_eol)
@@ -21,7 +22,9 @@ pub fn setTty(value: bool) void {
 }
 
 /// Broken-down LOCAL wall-clock time to the millisecond (C: localtime + .%03d ms).
-const LocalTime = struct { month: u8, day: u8, hour: u8, minute: u8, second: u8, millis: u16 };
+/// `utc` is set when no timezone could be resolved and the fields are therefore
+/// UTC; the formatter marks those lines so they cannot be misread as local.
+const LocalTime = struct { month: u8, day: u8, hour: u8, minute: u8, second: u8, millis: u16, utc: bool = false };
 
 // Windows GetLocalTime gives every field (incl. milliseconds) directly. Declared at top
 // level but referenced only in the is_windows branch, so the POSIX build prunes it.
@@ -50,12 +53,26 @@ fn nowLocal() LocalTime {
             .millis = @intCast(st.wMilliseconds),
         };
     } else {
-        // POSIX: pure-Zig UTC breakdown via std.time.epoch (no libc localtime_r,
-        // so the miner links no libc on Linux/Android). Timestamps are UTC rather
-        // than local wall-clock -- a deliberate trade for a fully pure-Zig build;
-        // Windows still shows local time via GetLocalTime.
+        // POSIX: no libc, so no localtime_r, and std has no timezone facility.
+        // tz.zig resolves the offset itself (TZ, then /etc/localtime) so these
+        // line up with the C/Rust/Go siblings when logs sit side by side. Where
+        // no zone data exists -- Android typically has none -- the fields stay
+        // UTC and the formatter appends 'Z' rather than implying local time.
         const ms_total = std.time.milliTimestamp();
-        const secs: u64 = @intCast(@divFloor(ms_total, 1000));
+        const utc_secs = @divFloor(ms_total, 1000);
+        var off: ?i32 = tz.offsetAt(utc_secs);
+        // std.time.epoch is epoch-relative and unsigned: a pre-1970 instant
+        // would make @intCast illegal behaviour (UB in the ReleaseFast build
+        // we ship). An unsynced RTC on a freshly booted phone or SBC reports
+        // ~0, which any western offset pushes negative -- so drop the offset
+        // and mark the line rather than trusting the arithmetic.
+        var shifted = utc_secs + (off orelse 0);
+        if (shifted < 0) {
+            off = null;
+            shifted = utc_secs;
+        }
+        if (shifted < 0) shifted = 0;
+        const secs: u64 = @intCast(shifted);
         const es = std.time.epoch.EpochSeconds{ .secs = secs };
         const yd = es.getEpochDay().calculateYearDay();
         const md = yd.calculateMonthDay();
@@ -67,6 +84,7 @@ fn nowLocal() LocalTime {
             .minute = ds.getMinutesIntoHour(),
             .second = ds.getSecondsIntoMinute(),
             .millis = @intCast(@mod(ms_total, 1000)),
+            .utc = off == null,
         };
     }
 }
@@ -76,8 +94,11 @@ fn formatLogLine(buf: []u8, lt: LocalTime, level: []const u8, msg: []const u8, t
     const n = @min(level.len, lvl.len);
     @memcpy(lvl[0..n], level[0..n]);
 
-    return std.fmt.bufPrint(buf, "{s}{d:0>2}/{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}  {s} {s}\n", .{
-        if (tty) "\r" ++ A_CLREOL else "", lt.day, lt.month, lt.hour, lt.minute, lt.second, lt.millis, lvl[0..], msg,
+    // 'Z' marks a line whose clock could not be resolved to local time. The two
+    // spaces before the level are preserved either way, so the level column
+    // stays aligned within a session (a host is consistently one or the other).
+    return std.fmt.bufPrint(buf, "{s}{d:0>2}/{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}{s}  {s} {s}\n", .{
+        if (tty) "\r" ++ A_CLREOL else "", lt.day, lt.month, lt.hour, lt.minute, lt.second, lt.millis, if (lt.utc) "Z" else "", lvl[0..], msg,
     }) catch buf[0..0];
 }
 
@@ -120,4 +141,26 @@ test "formatLogLine clears any live status row before logging" {
         .millis = 466,
     }, "INFO", "Connected", false);
     try std.testing.expectEqualStrings("19/06 13:27:12.466  INFO  Connected\n", plain);
+}
+
+test "formatLogLine marks a line whose clock could not be resolved to local time" {
+    var buf: [128]u8 = undefined;
+    const fields = LocalTime{
+        .month = 6,
+        .day = 19,
+        .hour = 13,
+        .minute = 27,
+        .second = 12,
+        .millis = 466,
+        .utc = true,
+    };
+    const line = formatLogLine(&buf, fields, "INFO", "Connected", false);
+    // 'Z' immediately after the milliseconds; the two-space gap before the
+    // level is unchanged, so the level column still lines up.
+    try std.testing.expectEqualStrings("19/06 13:27:12.466Z  INFO  Connected\n", line);
+
+    // ERROR fills the 5-column level field, leaving a single space -- the same
+    // rule the C miner's %-5s produces. Verify the marker doesn't disturb it.
+    const err_line = formatLogLine(&buf, fields, "ERROR", "connection lost", false);
+    try std.testing.expectEqualStrings("19/06 13:27:12.466Z  ERROR connection lost\n", err_line);
 }
