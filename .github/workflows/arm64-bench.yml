@@ -1,0 +1,86 @@
+name: arm64-bench
+
+# Native aarch64 measurement on GitHub's ubuntu-24.04-arm runners. qemu proves
+# byte-exactness and says nothing about speed -- it emulates sha256h in software
+# too, so the accelerated path can even look slower there. This is the only
+# honest place to measure the ARMv8 SHA-256 work.
+#
+# Dispatch-only, so every run is attributable to a person and a reason. Numbers
+# from a shared runner order alternatives (hardware vs software SHA); they are
+# not absolute hashrate claims for any particular phone.
+#
+# THIS FILE IS THE MEASURING INSTRUMENT: do not edit it to make a number move.
+
+on:
+  workflow_dispatch:
+    inputs:
+      threads:
+        description: "mining threads (blank = nproc)"
+        default: ""
+      seconds:
+        description: "seconds per bench leg"
+        default: "20"
+      repeats:
+        description: "legs per arm (compare medians, not single runs)"
+        default: "5"
+
+jobs:
+  bench:
+    name: Hardware vs software SHA-256 (native aarch64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    defaults:
+      run:
+        # GitHub's implicit shell is `bash -e {0}` with no pipefail, which would
+        # let a failing build hide behind a `| tee`.
+        shell: bash
+    env:
+      THREADS_IN: ${{ inputs.threads }}
+      SECONDS_PER_LEG: ${{ inputs.seconds }}
+      REPEATS: ${{ inputs.repeats }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-zig
+
+      - name: Runner facts
+        run: |
+          uname -m
+          nproc
+          grep -m1 Features /proc/cpuinfo || true
+          grep -qw sha2 /proc/cpuinfo \
+            || { echo 'ERROR: runner CPU lacks the sha2 hwcap -- the comparison would be meaningless'; exit 1; }
+
+      - name: Build (native) and confirm the accelerated path is live
+        run: |
+          zig build bench -Doptimize=ReleaseFast -Dcpu=native
+          zig build -Doptimize=ReleaseFast -Dcpu=native
+          ./zig-out/bin/zig-miner --selftest | tee selftest.log
+          grep -q 'sha backend: armv8-sha2' selftest.log
+          grep -q 'hash2 parity: PASS' selftest.log
+
+      # One binary, both arms: DERO_NO_ARM_SHA=1 forces the software fallback,
+      # so the SHA backend is the only thing that differs between the two
+      # measurements -- no rebuild, no flag drift.
+      - name: Measure hardware vs software SHA
+        run: |
+          THREADS="${THREADS_IN:-$(nproc)}"
+          echo "threads=$THREADS seconds=$SECONDS_PER_LEG repeats=$REPEATS"
+          for i in $(seq 1 "$REPEATS"); do
+            DERO_NO_ARM_SHA=1 ./zig-out/bin/bench "$THREADS" "$SECONDS_PER_LEG"
+          done 2>&1 | tee bench-software.log
+          sleep 15
+          for i in $(seq 1 "$REPEATS"); do
+            ./zig-out/bin/bench "$THREADS" "$SECONDS_PER_LEG"
+          done 2>&1 | tee bench-hardware.log
+          echo "=== software (DERO_NO_ARM_SHA=1) ==="; grep -E 'KH/s' bench-software.log || cat bench-software.log
+          echo "=== hardware (ARMv8 SHA-256) ==="; grep -E 'KH/s' bench-hardware.log || cat bench-hardware.log
+
+      - uses: actions/upload-artifact@v4
+        if: always() # the partial logs are the post-mortem when a step fails
+        with:
+          name: arm64-bench
+          path: |
+            selftest.log
+            bench-*.log
+          if-no-files-found: ignore
+          overwrite: true

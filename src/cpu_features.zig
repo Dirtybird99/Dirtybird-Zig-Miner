@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const console = @import("console.zig");
+const sha_mb = @import("sha256_mb.zig");
 
 const CpuidLeaf = struct {
     eax: u32 = 0,
@@ -44,6 +45,8 @@ pub const CpuReport = struct {
     avx512vl: bool = false,
     avx512vnni: bool = false,
     sha: bool = false,
+    /// aarch64: the ARMv8 crypto extension backing the final SHA-256.
+    armv8_sha2: bool = false,
     build_sha_avx2: bool = buildHasShaAvx2(),
 
     pub fn brandSlice(self: *const CpuReport) []const u8 {
@@ -55,12 +58,18 @@ pub const CpuReport = struct {
 pub fn detect() CpuReport {
     return switch (builtin.cpu.arch) {
         .x86, .x86_64 => detectX86(),
+        .aarch64 => .{ .armv8_sha2 = sha_mb.armSha2Available() },
         else => .{},
     };
 }
 
 pub fn log(report: CpuReport) void {
     console.logLine("INFO", "CPU: {s}", .{report.brandSlice()});
+    if (builtin.cpu.arch == .aarch64) {
+        console.logLine("INFO", "Features: sha2 {s}", .{yesNo(report.armv8_sha2)});
+        console.logLine("INFO", "Fast path: ARMv8 SHA-256 {s}", .{yesNo(sha_mb.accelerated())});
+        return;
+    }
     console.logLine("INFO", "Features: avx2 {s} | avx512 {s} | sha {s}", .{
         yesNo(report.avx2),
         yesNo(report.avx512),

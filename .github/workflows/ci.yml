@@ -49,7 +49,10 @@ jobs:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup-zig
       # Cross-build a fully-static aarch64 musl binary and run its KAT under
-      # qemu-user (no SHA-NI on ARM -> portable std.crypto path; KAT still validates).
+      # qemu-user. The final SHA-256 runs on the ARMv8 crypto extensions via a
+      # separate +sha2 object (src/sha256_hw_arm.zig) chosen by a runtime HWCAP
+      # probe, so this job has to prove three separate things: the instructions
+      # are in the binary, the runtime picked that path, and it is byte-correct.
       # NOTE: qemu execs the binary directly (kernel-load) -- it proves the binary runs,
       # but NOT Termux's system_linker_exec path (Android 10+ runs /system/bin/linker64
       # ./zig-miner), which is the real Android gate. We assert ET_DYN here so a PIE
@@ -58,11 +61,39 @@ jobs:
       - name: Cross-build aarch64 (static PIE) + KAT under QEMU
         run: |
           zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl -p out-arm64
-          readelf -h out-arm64/bin/zig-miner | grep -q 'Type:.*DYN' \
+          BIN=out-arm64/bin/zig-miner
+          readelf -h "$BIN" | grep -q 'Type:.*DYN' \
             || { echo 'ERROR: arm64 binary is not PIE (ET_DYN) -- Android/Termux will reject it'; \
-                 readelf -h out-arm64/bin/zig-miner | grep -i type; exit 1; }
-          sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static
-          qemu-aarch64-static ./out-arm64/bin/zig-miner --selftest
+                 readelf -h "$BIN" | grep -i type; exit 1; }
+          sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static llvm
+
+          # The ARMv8 SHA instructions must actually be in the image. Use
+          # llvm-objdump: the stock binutils objdump on an x86 runner cannot
+          # decode aarch64 -- it prints nothing and exits 0, so a plain grep
+          # reports "feature missing" and "wrong tool" identically. Require a
+          # large decoded-instruction count first so a zero can be trusted.
+          DECODED=$(llvm-objdump -d "$BIN" | grep -cE '^[[:space:]]+[0-9a-f]+:' || true)
+          echo "decoded instructions: $DECODED"
+          [ "$DECODED" -ge 5000 ] \
+            || { echo "ERROR: disassembler decoded $DECODED instructions -- cannot trust a zero"; exit 1; }
+          SHA_INSTRS=$(llvm-objdump -d "$BIN" | grep -cE 'sha256(h|h2|su0|su1)' || true)
+          echo "ARMv8 SHA-256 instructions: $SHA_INSTRS"
+          [ "$SHA_INSTRS" -ge 1 ] \
+            || { echo 'ERROR: no ARMv8 SHA-256 instructions -- the +sha2 object did not link'; exit 1; }
+
+          # KAT (hash1) + backend identity + hash2 differential (the mining path).
+          qemu-aarch64-static "$BIN" --selftest | tee arm64-selftest.log
+          grep -q 'pow(a): .* PASS' arm64-selftest.log
+          grep -q 'sha backend: armv8-sha2' arm64-selftest.log \
+            || { echo 'ERROR: runtime did not select the ARMv8 SHA path'; exit 1; }
+          grep -q 'hash2 parity: PASS' arm64-selftest.log
+
+          # The software fallback a crypto-less core would take must still be
+          # correct -- qemu advertises SHA2 on every model, so force it.
+          DERO_NO_ARM_SHA=1 qemu-aarch64-static "$BIN" --selftest | tee arm64-fallback.log
+          grep -q 'sha backend: software' arm64-fallback.log
+          grep -q 'pow(a): .* PASS' arm64-fallback.log
+          grep -q 'hash2 parity: PASS' arm64-fallback.log
 
   hygiene:
     name: Repo Hygiene

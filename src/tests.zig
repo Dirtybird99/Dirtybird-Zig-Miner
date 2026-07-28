@@ -8,6 +8,7 @@ test {
     _ = @import("primitives/fnv1a.zig");
     _ = @import("primitives/xxhash64.zig");
     _ = @import("primitives/siphash.zig");
+    _ = @import("sha256_mb.zig");
     _ = @import("suffix_array.zig");
     _ = @import("sa_fast.zig");
     _ = @import("testvec.zig");
