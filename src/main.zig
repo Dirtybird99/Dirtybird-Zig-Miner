@@ -452,6 +452,30 @@ fn formatStatusLineChecked(buf: []u8, stats: ReportStats, tty: bool, columns: us
     return ansiClamp(buf, minimal, budget);
 }
 
+/// Whether the live status row has anything true to report this tick.
+///
+/// A displayed 0.00 KH/s is not a rare fault -- it is what every launch prints.
+/// getwork sends no job at connect time (the first arrives on a dispatch tick
+/// ~500ms later), so dial + TLS + upgrade + first job is ~1-3s of genuine zero
+/// and the reporter's first tick lands inside it. Reconnect backoff (1s
+/// doubling to a 30s cap) is the same story, repeatedly, on a flaky link.
+///
+/// No DERO miner in the ecosystem displays a live zero. tnn-miner -- the
+/// ancestor this miner's worker gate already cites -- suppresses its row two
+/// ways: `if (!isConnected) return 1;` (reporter.cpp:31) plus a first-hashrate
+/// gate commented "Mining hasn't started yet - don't print status, just
+/// accumulate stats". 8lecramm's C miner reaches the same result structurally,
+/// calling print_status only from inside the worker thread. netrunner's GUI
+/// shows a grey "---" placeholder and a separate "Offline" label.
+///
+/// Suppressing rather than printing a reason is safe here because the
+/// transitions are already logged, and console.logLine emits `\r\x1b[K` before
+/// its text -- so a log line erases whatever row is on screen instead of
+/// leaving a stale one behind.
+fn statusRowHasSomethingToSay(connected: bool, job_epoch: u64) bool {
+    return connected and job_epoch > 0;
+}
+
 fn reporter() void {
     var timer = std.time.Timer.start() catch |err| {
         console.logLine("ERROR", "status timer initialization failed: {s}", .{@errorName(err)});
@@ -483,23 +507,37 @@ fn reporter() void {
         var dbuf: [24]u8 = undefined;
         const diff = fmtDiff(&dbuf, G.difficulty.load(.monotonic));
 
-        // Five rungs of worst-case u64 fields plus 16 SGR sequences; 1024 was
-        // sized for three rungs and would degrade to a bare "\r\x1b[K" on
-        // overflow rather than narrowing.
-        var line_buf: [2048]u8 = undefined;
-        const line = formatStatusLine(&line_buf, .{
-            .rate = rate,
-            .avg = avg,
-            .height = height,
-            .accepted = accepted,
-            .blocks = blocks,
-            .rejected = rejected,
-            .diff = diff,
-            .hh = hh,
-            .mm = mm,
-            .ss = ss,
-        }, g_status_tty, if (g_status_tty) terminalColumns() else 0);
-        std.debug.print("{s}", .{line});
+        // The sampling above runs on EVERY tick, printed or not: skipping it
+        // would let the sliding window go stale, so the rate would read wrong
+        // for ~10s after mining resumes. tnn's reporter says the same thing --
+        // "don't print status, just accumulate stats".
+        //
+        // The redirected record is deliberately NOT suppressed. It is
+        // machine-parsed (HiveOS consumes it), where a run of 0.00 records
+        // during an outage is the correct report and a gap is not.
+        const worth_printing = statusRowHasSomethingToSay(
+            G.connected.load(.monotonic),
+            G.job_epoch.load(.acquire),
+        );
+        if (!g_status_tty or worth_printing) {
+            // Five rungs of worst-case u64 fields plus 16 SGR sequences; 1024
+            // was sized for three rungs and would degrade to a bare "\r\x1b[K"
+            // on overflow rather than narrowing.
+            var line_buf: [2048]u8 = undefined;
+            const line = formatStatusLine(&line_buf, .{
+                .rate = rate,
+                .avg = avg,
+                .height = height,
+                .accepted = accepted,
+                .blocks = blocks,
+                .rejected = rejected,
+                .diff = diff,
+                .hh = hh,
+                .mm = mm,
+                .ss = ss,
+            }, g_status_tty, if (g_status_tty) terminalColumns() else 0);
+            std.debug.print("{s}", .{line});
+        }
 
         // The funnel is a separate record, never part of the status line. When
         // it lived inside the line it was counted as columns, so -v could push
@@ -810,6 +848,24 @@ test "difficulty humanisation truncates and never rounds" {
         var buf: [24]u8 = undefined;
         try std.testing.expectEqualStrings(c.want, fmtDiff(&buf, c.in));
     }
+}
+
+test "the status row stays silent until there is something true to report" {
+    // Every launch: not connected, no job. This is the tick that used to print
+    // "[DIRTYBIRD] 0.00 KH/s (0.00 KH/s avg) | Height:0 | ..." on every run.
+    try std.testing.expect(!statusRowHasSomethingToSay(false, 0));
+
+    // Connected, but getwork has not pushed a job yet -- workers are still
+    // parked on the startup gate, so the rate is genuinely zero.
+    try std.testing.expect(!statusRowHasSomethingToSay(true, 0));
+
+    // Mining.
+    try std.testing.expect(statusRowHasSomethingToSay(true, 1));
+
+    // Dropped mid-run. A job was seen earlier, so job_epoch stays high, but
+    // workers are parked on the disconnect gate for the whole backoff (1s
+    // doubling to 30s). Having once had a job must not keep the row alive.
+    try std.testing.expect(!statusRowHasSomethingToSay(false, 5));
 }
 
 test "a 100-hour uptime widens every rung carrying it" {
