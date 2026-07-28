@@ -1,158 +1,156 @@
 //! tz.zig -- local UTC offset, resolved without libc.
 //!
-//! WHY THIS EXISTS: `localtime_r` is a libc function and this miner links no
-//! libc on Linux/Android (that is the point of the pure-Zig build), while Zig
-//! 0.14's std has no timezone facility at all -- `std.time.epoch` breaks a Unix
-//! timestamp into UTC fields and stops there. So log lines were UTC on POSIX
-//! while the C++, Rust and Go siblings printed local wall-clock in the very
-//! same format: a Zig line silently read hours off with nothing marking it.
-//! This resolves the offset ourselves, and `offsetAt` returns null wherever it
-//! genuinely cannot -- console.zig then marks that line `Z` rather than
-//! pretending. A wrong offset would be worse than an honest UTC.
+//! WHY THIS EXISTS: `localtime_r` is libc and this miner links none on
+//! Linux/Android, so log lines were UTC on POSIX while the C++, Rust and Go
+//! siblings printed local wall-clock in the very same format -- a Zig line
+//! silently read hours off with nothing marking it.
+//!
+//! Zig's std ships a TZif *parser* (`std.tz`, RFC 9636/8536) but no zone
+//! *resolution*: nothing maps "now" to an offset, and nothing finds the zone
+//! file in the first place. That gap is what this file fills. The binary
+//! format is std's problem, deliberately -- an earlier version of this file
+//! hand-rolled the parser and got it wrong in the way the format punishes
+//! (see the note on slim files below).
 //!
 //! Sources, first hit wins: the TZ environment variable, then /etc/localtime.
-//! Android usually has neither (bionic resolves zones through a system property
-//! and a tzdata container), which is exactly the case the marker is for.
+//! `offsetAt` returns null wherever the zone genuinely cannot be resolved, and
+//! console.zig then marks that line `Z`. A wrong offset is worse than an
+//! honest UTC, so every unparseable input resolves to null rather than a guess.
+//!
+//! ANDROID: bionic reads a single concatenated `tzdata` container (under
+//! /apex/com.android.tzdata/etc/tz/ or /system/usr/share/zoneinfo/) and never
+//! consults TZDIR or a per-zone file tree, so none of the lookups below can
+//! succeed there. Android is expected to fall through to the `Z` marker.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// Caps keep this allocation-free, matching the rest of the codebase. Real
-/// zone files carry a few hundred transitions; anything past these limits
-/// resolves to null rather than to a half-parsed answer.
-const max_transitions = 1200;
-const max_types = 64;
+const is_windows_target = builtin.os.tag == .windows;
 
-const Ttinfo = struct { utoff: i32 = 0, isdst: bool = false };
+/// RFC 9636 §3.2 bounds on a UT offset. Anything outside is a corrupt file, and
+/// a corrupt offset must not reach the clock arithmetic in console.zig.
+const min_utoff: i32 = -89999;
+const max_utoff: i32 = 93599;
 
-const Zone = struct {
-    /// Transition instants (UTC seconds), ascending.
-    times: [max_transitions]i64 = undefined,
-    /// Index into `types` effective from the matching transition onwards.
-    idx: [max_transitions]u8 = undefined,
-    n: usize = 0,
-    types: [max_types]Ttinfo = undefined,
-    ntypes: usize = 0,
-    /// Offset before the first transition (or the whole answer for a fixed
-    /// zone parsed from a TZ string with no DST rule).
-    initial: i32 = 0,
+/// Zone data is parsed once at first use and lives for the process, so it is
+/// carved out of a fixed buffer rather than the heap: no allocator plumbing,
+/// no steady-state allocation. Real zone files are a few KiB.
+var arena_buf: [96 * 1024]u8 = undefined;
 
-    fn offsetAt(self: *const Zone, utc_secs: i64) i32 {
-        if (self.n == 0) return self.initial;
-        // Last transition at or before the instant. Ascending, so binary search.
-        var lo: usize = 0;
-        var hi: usize = self.n;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (self.times[mid] <= utc_secs) lo = mid + 1 else hi = mid;
-        }
-        if (lo == 0) return self.initial;
-        const t = self.idx[lo - 1];
-        if (t >= self.ntypes) return self.initial;
-        return self.types[t].utoff;
-    }
+const Resolved = union(enum) {
+    /// Transition table plus the trailing POSIX rule, which is the sole
+    /// authority for instants after the last stored transition.
+    tzif: struct { tz: std.tz.Tz, footer: ?PosixRule },
+    /// A TZ value that was itself a POSIX rule, or a fixed offset.
+    rule: PosixRule,
+    fixed: i32,
 };
 
-/// A POSIX TZ rule ("EST5EDT,M3.2.0,M11.1.0"): two offsets and the M-form
-/// dates they switch on. Evaluated per instant rather than baked in, so a
-/// long-running miner follows a DST change instead of freezing at startup.
-const PosixRule = struct {
-    std_off: i32,
-    dst_off: i32,
-    start: MRule,
-    end: MRule,
-
-    const MRule = struct { month: u8, week: u8, day: u8, secs: i32 };
-
-    fn offsetAt(self: *const PosixRule, utc_secs: i64) i32 {
-        // Transition instants are given in local time; using the standard
-        // offset for both comparisons is off by an hour for the few hours
-        // around each switch, which is immaterial for a log timestamp.
-        const local = utc_secs + self.std_off;
-        const year = yearOf(local);
-        const s = instantOf(self.start, year);
-        const e = instantOf(self.end, year);
-        const in_dst = if (s <= e) (local >= s and local < e) else (local >= s or local < e);
-        return if (in_dst) self.dst_off else self.std_off;
-    }
-};
-
-var zone: Zone = .{};
-var posix: ?PosixRule = null;
-var resolved = false;
+var resolved: ?Resolved = null;
 var once = std.once(resolve);
 
 /// Seconds east of UTC for `utc_secs`, or null when no zone data could be
-/// found or trusted. Cheap after the first call: the zone is parsed once and
-/// only the lookup runs per line.
+/// found or trusted. Parsing happens once; only the lookup runs per line.
 pub fn offsetAt(utc_secs: i64) ?i32 {
     if (is_windows_target) return null; // Windows uses GetLocalTime directly.
     once.call();
-    if (!resolved) return null;
-    if (posix) |p| return p.offsetAt(utc_secs);
-    return zone.offsetAt(utc_secs);
+    const r = resolved orelse return null;
+    const off: i32 = switch (r) {
+        .fixed => |f| f,
+        .rule => |p| p.offsetAt(utc_secs),
+        .tzif => |t| tzifOffset(t.tz, t.footer, utc_secs),
+    };
+    // Belt and braces: std.tz does not range-check `offset`, and console.zig
+    // must never be handed something that makes its clock arithmetic negative.
+    if (off < min_utoff or off > max_utoff) return null;
+    return off;
 }
 
-const is_windows_target = builtin.os.tag == .windows;
+/// Offset from a parsed zone: the last transition at or before the instant,
+/// except past the final transition, where the footer rule takes over. Slim
+/// TZif files (zic's default since tzcode 2020b) stop their table decades ago
+/// and rely on that footer entirely -- America/New_York's last transition is
+/// in 2007 -- so ignoring it means reporting a permanently stale offset.
+fn tzifOffset(tz: std.tz.Tz, footer: ?PosixRule, utc_secs: i64) i32 {
+    const ts = tz.transitions;
+    if (ts.len == 0) return if (footer) |f| f.offsetAt(utc_secs) else firstStandard(tz);
+    if (utc_secs >= ts[ts.len - 1].ts) {
+        if (footer) |f| return f.offsetAt(utc_secs);
+        return ts[ts.len - 1].timetype.offset;
+    }
+    if (utc_secs < ts[0].ts) return firstStandard(tz);
+
+    var lo: usize = 0;
+    var hi: usize = ts.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (ts[mid].ts <= utc_secs) lo = mid + 1 else hi = mid;
+    }
+    return ts[lo - 1].timetype.offset;
+}
+
+/// Before the first transition, RFC 9636 §4 says to use the first timetype
+/// that is not DST, falling back to the first one.
+fn firstStandard(tz: std.tz.Tz) i32 {
+    for (tz.timetypes) |t| {
+        if (!t.isDst()) return t.offset;
+    }
+    return if (tz.timetypes.len > 0) tz.timetypes[0].offset else 0;
+}
 
 fn resolve() void {
     if (is_windows_target) return;
 
-    if (std.posix.getenv("TZ")) |tz| {
-        if (resolveTz(tz)) resolved = true;
-        // An explicitly set but unparseable TZ is NOT silently replaced by
-        // /etc/localtime: the user asked for something specific, and guessing
-        // differently would be the wrong kind of helpful.
+    if (std.posix.getenv("TZ")) |tz_env| {
+        // A TZ the user set explicitly is never silently replaced by
+        // /etc/localtime: guessing differently is the wrong kind of helpful.
+        resolveTz(tz_env);
         return;
     }
-    if (loadFile("/etc/localtime")) resolved = true;
+    _ = loadFile("/etc/localtime");
 }
 
-fn resolveTz(tz_in: []const u8) bool {
+fn resolveTz(tz_in: []const u8) void {
     var tz = tz_in;
     if (tz.len > 0 and tz[0] == ':') tz = tz[1..];
     if (tz.len == 0) {
-        zone = .{ .initial = 0 };
-        return true; // POSIX: empty TZ means UTC.
+        resolved = .{ .fixed = 0 }; // POSIX: empty TZ means UTC.
+        return;
     }
-    // A zone name -- look it up in the usual roots, including Termux's prefix.
-    if (std.mem.indexOfScalar(u8, tz, '/') != null) return loadZoneName(tz);
     if (std.ascii.eqlIgnoreCase(tz, "UTC") or std.ascii.eqlIgnoreCase(tz, "GMT")) {
-        zone = .{ .initial = 0 };
-        return true;
+        resolved = .{ .fixed = 0 };
+        return;
     }
-    // Otherwise a POSIX rule string; a bare name that is not a rule (e.g. a
-    // single-file zone like "EST") is also tried as a file.
-    if (parsePosix(tz)) return true;
-    return loadZoneName(tz);
+    // Try the POSIX rule form FIRST. Testing for '/' first would misroute every
+    // rule carrying an explicit transition time -- CET-1CEST,M3.5.0,M10.5.0/3
+    // and GMT0BST,M3.5.0/1,M10.5.0 among them, i.e. most of Europe.
+    if (parsePosix(tz)) |p| {
+        resolved = p;
+        return;
+    }
+    _ = loadZoneName(tz);
 }
 
 fn loadZoneName(name: []const u8) bool {
-    // Reject traversal: the name indexes a system database, not the filesystem.
-    if (std.mem.startsWith(u8, name, "/")) return loadFile(name);
+    // A zone name indexes a system database; it is not a path to follow.
+    // Reject traversal and absolute paths outright rather than opening them.
+    if (name.len == 0 or name[0] == '/') return false;
     if (std.mem.indexOf(u8, name, "..") != null) return false;
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (std.posix.getenv("TZDIR")) |dir| {
-        if (std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, name })) |p| {
-            if (loadFile(p)) return true;
-        } else |_| {}
-    }
-    const roots = [_][]const u8{
+    const roots = [_]?[]const u8{
+        std.posix.getenv("TZDIR"),
         "/usr/share/zoneinfo",
         "/etc/zoneinfo",
-        "/system/usr/share/zoneinfo", // Android, when present
     };
-    for (roots) |root| {
-        if (std.fmt.bufPrint(&buf, "{s}/{s}", .{ root, name })) |p| {
-            if (loadFile(p)) return true;
-        } else |_| {}
+    for (roots) |maybe_root| {
+        const root = maybe_root orelse continue;
+        const p = std.fmt.bufPrint(&buf, "{s}/{s}", .{ root, name }) catch continue;
+        if (loadFile(p)) return true;
     }
-    // Termux installs its own zoneinfo under $PREFIX.
-    if (std.posix.getenv("PREFIX")) |prefix| {
-        if (std.fmt.bufPrint(&buf, "{s}/share/zoneinfo/{s}", .{ prefix, name })) |p| {
-            if (loadFile(p)) return true;
-        } else |_| {}
+    if (std.posix.getenv("PREFIX")) |prefix| { // Termux
+        const p = std.fmt.bufPrint(&buf, "{s}/share/zoneinfo/{s}", .{ prefix, name }) catch return false;
+        if (loadFile(p)) return true;
     }
     return false;
 }
@@ -160,144 +158,83 @@ fn loadZoneName(name: []const u8) bool {
 fn loadFile(path: []const u8) bool {
     const f = std.fs.openFileAbsolute(path, .{}) catch return false;
     defer f.close();
-    var buf: [64 * 1024]u8 = undefined;
-    const n = f.readAll(&buf) catch return false;
-    return parseTzif(buf[0..n]);
-}
 
-// ---------------------------------------------------------------------------
-// TZif (RFC 8536)
-// ---------------------------------------------------------------------------
+    // A FIFO would block this thread forever inside std.once, taking every
+    // logging thread with it. Only ever read a regular file.
+    const st = f.stat() catch return false;
+    if (st.kind != .file) return false;
 
-const Counts = struct { isutcnt: u32, isstdcnt: u32, leapcnt: u32, timecnt: u32, typecnt: u32, charcnt: u32 };
+    var fba = std.heap.FixedBufferAllocator.init(&arena_buf);
+    const tz = std.tz.Tz.parse(fba.allocator(), f.reader()) catch return false;
 
-fn readCounts(b: []const u8) Counts {
-    return .{
-        .isutcnt = std.mem.readInt(u32, b[20..24], .big),
-        .isstdcnt = std.mem.readInt(u32, b[24..28], .big),
-        .leapcnt = std.mem.readInt(u32, b[28..32], .big),
-        .timecnt = std.mem.readInt(u32, b[32..36], .big),
-        .typecnt = std.mem.readInt(u32, b[36..40], .big),
-        .charcnt = std.mem.readInt(u32, b[40..44], .big),
-    };
-}
+    var footer: ?PosixRule = null;
+    if (tz.footer) |ft| footer = parsePosixRule(ft);
 
-/// Parse a TZif image into `zone`. Prefers the 64-bit v2+ block when present.
-/// Returns false on anything malformed -- callers then fall through to UTC.
-pub fn parseTzif(buf: []const u8) bool {
-    if (buf.len < 44 or !std.mem.eql(u8, buf[0..4], "TZif")) return false;
-    const version = buf[4];
-
-    const c1 = readCounts(buf);
-    if (c1.typecnt == 0) return false;
-    const v1_body = 44 + c1.timecnt * 4 + c1.timecnt + c1.typecnt * 6 +
-        c1.charcnt + c1.leapcnt * 8 + c1.isstdcnt + c1.isutcnt;
-
-    if (version != 0 and buf.len >= 44 + v1_body + 44) {
-        // v2/v3: a second header + 64-bit block follows the v1 block.
-        const h2 = buf[44 + v1_body ..];
-        if (h2.len >= 44 and std.mem.eql(u8, h2[0..4], "TZif")) {
-            const c2 = readCounts(h2);
-            if (c2.typecnt == 0) return false;
-            return parseBlock(h2[44..], c2, 8);
-        }
-    }
-    return parseBlock(buf[44..], c1, 4);
-}
-
-fn parseBlock(b: []const u8, c: Counts, time_size: usize) bool {
-    if (c.timecnt > max_transitions or c.typecnt > max_types) return false;
-
-    const times_len = c.timecnt * time_size;
-    const idx_len = c.timecnt;
-    const types_len = c.typecnt * 6;
-    if (b.len < times_len + idx_len + types_len + c.charcnt) return false;
-
-    var z: Zone = .{};
-    z.n = c.timecnt;
-    z.ntypes = c.typecnt;
-
-    var i: usize = 0;
-    while (i < c.timecnt) : (i += 1) {
-        const off = i * time_size;
-        z.times[i] = if (time_size == 8)
-            std.mem.readInt(i64, b[off..][0..8], .big)
-        else
-            std.mem.readInt(i32, b[off..][0..4], .big);
-        if (i > 0 and z.times[i] < z.times[i - 1]) return false; // must ascend
-    }
-
-    const idx_base = times_len;
-    i = 0;
-    while (i < c.timecnt) : (i += 1) {
-        const t = b[idx_base + i];
-        if (t >= c.typecnt) return false;
-        z.idx[i] = t;
-    }
-
-    const types_base = idx_base + idx_len;
-    i = 0;
-    while (i < c.typecnt) : (i += 1) {
-        const off = types_base + i * 6;
-        z.types[i] = .{
-            .utoff = std.mem.readInt(i32, b[off..][0..4], .big),
-            .isdst = b[off + 4] != 0,
-        };
-    }
-
-    // Before the first transition, prefer the first non-DST type (RFC 8536 §4).
-    z.initial = z.types[0].utoff;
-    i = 0;
-    while (i < c.typecnt) : (i += 1) {
-        if (!z.types[i].isdst) {
-            z.initial = z.types[i].utoff;
-            break;
-        }
-    }
-
-    zone = z;
-    posix = null;
+    resolved = .{ .tzif = .{ .tz = tz, .footer = footer } };
     return true;
 }
 
 // ---------------------------------------------------------------------------
-// POSIX TZ strings
+// POSIX TZ strings -- "std offset[dst[offset]][,start,end]"
 // ---------------------------------------------------------------------------
 
-/// "std offset[dst[offset]][,start,end]". Returns false for forms we do not
-/// evaluate (J<n> / bare <n> day rules), so they fall through rather than
-/// producing a confidently wrong time.
-fn parsePosix(s: []const u8) bool {
-    var i: usize = 0;
-    const std_name = scanName(s, &i) orelse return false;
-    _ = std_name;
-    const std_off = scanOffset(s, &i) orelse return false;
-    // POSIX offsets are "west of UTC" -- invert to seconds east.
-    const std_east = -std_off;
+const PosixRule = struct {
+    std_off: i32,
+    dst_off: i32,
+    start: ?MRule = null,
+    end: ?MRule = null,
 
-    if (i >= s.len) {
-        zone = .{ .initial = std_east };
-        posix = null;
-        return true;
+    const MRule = struct { month: u8, week: u8, day: u8, secs: i32 };
+
+    fn offsetAt(self: PosixRule, utc_secs: i64) i32 {
+        const s_rule = self.start orelse return self.std_off;
+        const e_rule = self.end orelse return self.std_off;
+        // Transition instants are local; using the standard offset for both
+        // comparisons is off by an hour for the few hours either side of a
+        // switch, which is immaterial for a log timestamp.
+        const local = utc_secs + self.std_off;
+        const year = yearOf(local);
+        const s = instantOf(s_rule, year);
+        const e = instantOf(e_rule, year);
+        const in_dst = if (s <= e) (local >= s and local < e) else (local >= s or local < e);
+        return if (in_dst) self.dst_off else self.std_off;
     }
+};
 
-    const dst_name = scanName(s, &i) orelse return false;
-    _ = dst_name;
-    // DST offset defaults to one hour ahead of standard.
+fn parsePosix(s: []const u8) ?Resolved {
+    const r = parsePosixRule(s) orelse return null;
+    if (r.start == null) return .{ .fixed = r.std_off };
+    return .{ .rule = r };
+}
+
+/// Returns null for anything not fully understood -- J<n> and bare <n> day
+/// forms included -- so an unsupported rule degrades to a marked UTC rather
+/// than a confidently wrong offset.
+fn parsePosixRule(s: []const u8) ?PosixRule {
+    var i: usize = 0;
+    _ = scanName(s, &i) orelse return null;
+    const std_off = scanOffset(s, &i) orelse return null;
+    const std_east = -std_off; // POSIX offsets are west-positive.
+    if (std_east < min_utoff or std_east > max_utoff) return null;
+
+    if (i >= s.len) return .{ .std_off = std_east, .dst_off = std_east };
+
+    _ = scanName(s, &i) orelse return null;
     var dst_east = std_east + 3600;
     if (i < s.len and s[i] != ',') {
-        const d = scanOffset(s, &i) orelse return false;
+        const d = scanOffset(s, &i) orelse return null;
         dst_east = -d;
     }
-    if (i >= s.len or s[i] != ',') return false;
+    if (dst_east < min_utoff or dst_east > max_utoff) return null;
+    if (i >= s.len or s[i] != ',') return null;
     i += 1;
-    const start = scanMRule(s, &i) orelse return false;
-    if (i >= s.len or s[i] != ',') return false;
+    const start = scanMRule(s, &i) orelse return null;
+    if (i >= s.len or s[i] != ',') return null;
     i += 1;
-    const end = scanMRule(s, &i) orelse return false;
+    const end = scanMRule(s, &i) orelse return null;
+    if (i != s.len) return null; // trailing junk means we did not understand it
 
-    posix = .{ .std_off = std_east, .dst_off = dst_east, .start = start, .end = end };
-    return true;
+    return .{ .std_off = std_east, .dst_off = dst_east, .start = start, .end = end };
 }
 
 fn scanName(s: []const u8, i: *usize) ?[]const u8 {
@@ -316,7 +253,9 @@ fn scanName(s: []const u8, i: *usize) ?[]const u8 {
     return s[start..j];
 }
 
-/// "[+|-]hh[:mm[:ss]]" -> seconds (POSIX sign convention: positive is west).
+/// "[+|-]hh[:mm[:ss]]" -> seconds, POSIX sign convention (positive is west).
+/// Each field is range-checked before it is multiplied, so a hostile TZ cannot
+/// overflow the arithmetic (which is UB in the ReleaseFast build we ship).
 fn scanOffset(s: []const u8, i: *usize) ?i32 {
     var j = i.*;
     if (j >= s.len) return null;
@@ -325,15 +264,15 @@ fn scanOffset(s: []const u8, i: *usize) ?i32 {
         neg = s[j] == '-';
         j += 1;
     }
-    const h = scanInt(s, &j) orelse return null;
+    const h = scanInt(s, &j, 24) orelse return null;
     var total: i32 = h * 3600;
     if (j < s.len and s[j] == ':') {
         j += 1;
-        const m = scanInt(s, &j) orelse return null;
+        const m = scanInt(s, &j, 59) orelse return null;
         total += m * 60;
         if (j < s.len and s[j] == ':') {
             j += 1;
-            const sec = scanInt(s, &j) orelse return null;
+            const sec = scanInt(s, &j, 59) orelse return null;
             total += sec;
         }
     }
@@ -341,29 +280,30 @@ fn scanOffset(s: []const u8, i: *usize) ?i32 {
     return if (neg) -total else total;
 }
 
-fn scanInt(s: []const u8, i: *usize) ?i32 {
+fn scanInt(s: []const u8, i: *usize, max: i32) ?i32 {
     const start = i.*;
     var j = start;
     while (j < s.len and std.ascii.isDigit(s[j])) j += 1;
-    if (j == start) return null;
+    if (j == start or j - start > 3) return null;
     const v = std.fmt.parseInt(i32, s[start..j], 10) catch return null;
+    if (v > max) return null;
     i.* = j;
     return v;
 }
 
-/// "M<month>.<week>.<day>[/<time>]" only. J<n> and bare <n> are rejected.
+/// "M<month>.<week>.<day>[/<time>]" only.
 fn scanMRule(s: []const u8, i: *usize) ?PosixRule.MRule {
     var j = i.*;
     if (j >= s.len or s[j] != 'M') return null;
     j += 1;
-    const month = scanInt(s, &j) orelse return null;
+    const month = scanInt(s, &j, 12) orelse return null;
     if (j >= s.len or s[j] != '.') return null;
     j += 1;
-    const week = scanInt(s, &j) orelse return null;
+    const week = scanInt(s, &j, 5) orelse return null;
     if (j >= s.len or s[j] != '.') return null;
     j += 1;
-    const day = scanInt(s, &j) orelse return null;
-    if (month < 1 or month > 12 or week < 1 or week > 5 or day < 0 or day > 6) return null;
+    const day = scanInt(s, &j, 6) orelse return null;
+    if (month < 1 or week < 1) return null;
 
     var secs: i32 = 2 * 3600; // POSIX default switch time
     if (j < s.len and s[j] == '/') {
@@ -375,7 +315,7 @@ fn scanMRule(s: []const u8, i: *usize) ?PosixRule.MRule {
 }
 
 // ---------------------------------------------------------------------------
-// Civil-date helpers (UTC only -- the offset is applied by the caller)
+// Civil-date helpers (UTC; the offset is applied by the caller)
 // ---------------------------------------------------------------------------
 
 fn isLeap(y: i32) bool {
@@ -411,17 +351,16 @@ fn yearOf(local_secs: i64) i32 {
     return y;
 }
 
-/// Day-of-week for a civil date, 0 = Sunday (1970-01-01 was a Thursday).
+/// Day of week for a civil date, 0 = Sunday (1970-01-01 was a Thursday).
 fn weekday(y: i32, m: i32, d: i32) i32 {
     return @intCast(@mod(daysFromCivil(y, m, d) + 4, 7));
 }
 
-/// Local-time instant of an M-rule in a given year, as seconds since epoch.
+/// Local instant of an M-rule in a given year, seconds since epoch.
 fn instantOf(r: PosixRule.MRule, year: i32) i64 {
     const month: i32 = r.month;
     const want: i32 = r.day;
     const first_dow = weekday(year, month, 1);
-    // Day-of-month of the first `want` weekday, then advance whole weeks.
     var dom: i32 = 1 + @mod(want - first_dow + 7, 7);
     var w: u8 = 1;
     const dim = daysInMonth(year, month);
@@ -446,68 +385,107 @@ fn daysInMonth(y: i32, m: i32) i32 {
 
 const testing = std.testing;
 
-/// Build a minimal TZif v1 image: one transition, two types.
-fn fixtureV1(transition: i32, before: i32, after: i32) [
-    44 + 4 + 1 + 12 + 1
-]u8 {
-    var b: [44 + 4 + 1 + 12 + 1]u8 = [_]u8{0} ** (44 + 4 + 1 + 12 + 1);
-    @memcpy(b[0..4], "TZif");
-    b[4] = 0; // version 1
-    std.mem.writeInt(u32, b[32..36], 1, .big); // timecnt
-    std.mem.writeInt(u32, b[36..40], 2, .big); // typecnt
-    std.mem.writeInt(u32, b[40..44], 1, .big); // charcnt
-    std.mem.writeInt(i32, b[44..48], transition, .big);
-    b[48] = 1; // the transition selects type 1
-    std.mem.writeInt(i32, b[49..53], before, .big); // type 0
-    b[53] = 0;
-    b[54] = 0;
-    std.mem.writeInt(i32, b[55..59], after, .big); // type 1
-    b[59] = 1; // isdst
-    b[60] = 0;
-    return b;
+test "POSIX: fixed offset, no DST rule" {
+    const r = parsePosixRule("EST5").?;
+    try testing.expectEqual(@as(i32, -5 * 3600), r.std_off);
+    try testing.expectEqual(@as(?PosixRule.MRule, null), r.start);
+    try testing.expectEqual(@as(i32, -5 * 3600), r.offsetAt(0));
 }
 
-test "TZif: offset before and after a transition" {
-    const b = fixtureV1(1000, -18000, -14400); // -5h then -4h
-    try testing.expect(parseTzif(&b));
-    try testing.expectEqual(@as(i32, -18000), zone.offsetAt(999));
-    try testing.expectEqual(@as(i32, -14400), zone.offsetAt(1000));
-    try testing.expectEqual(@as(i32, -14400), zone.offsetAt(1_000_000_000));
-}
-
-test "TZif: garbage and truncation are rejected, never guessed" {
-    try testing.expect(!parseTzif("not a tzif file at all"));
-    try testing.expect(!parseTzif(""));
-    const b = fixtureV1(1000, -18000, -14400);
-    try testing.expect(!parseTzif(b[0..50])); // truncated mid-body
-}
-
-test "POSIX TZ: fixed offset, no DST" {
-    try testing.expect(parsePosix("EST5"));
-    try testing.expectEqual(@as(?PosixRule, null), posix);
-    try testing.expectEqual(@as(i32, -5 * 3600), zone.offsetAt(0));
-}
-
-test "POSIX TZ: DST rule evaluated on both sides of the boundary" {
-    try testing.expect(parsePosix("EST5EDT,M3.2.0,M11.1.0"));
-    const p = posix.?;
-    // 2026: DST starts Sun 8 Mar, ends Sun 1 Nov (US rules).
+test "POSIX: DST evaluated on both sides of the boundary" {
+    const r = parsePosixRule("EST5EDT,M3.2.0,M11.1.0").?;
     const jan = daysFromCivil(2026, 1, 15) * 86400;
     const jul = daysFromCivil(2026, 7, 15) * 86400;
-    try testing.expectEqual(@as(i32, -5 * 3600), p.offsetAt(jan));
-    try testing.expectEqual(@as(i32, -4 * 3600), p.offsetAt(jul));
+    try testing.expectEqual(@as(i32, -5 * 3600), r.offsetAt(jan));
+    try testing.expectEqual(@as(i32, -4 * 3600), r.offsetAt(jul));
 }
 
-test "POSIX TZ: unsupported J-form is rejected rather than guessed" {
-    try testing.expect(!parsePosix("EST5EDT,J60,J300"));
+test "POSIX: rules carrying an explicit transition time are accepted" {
+    // These all contain '/', which an earlier version misrouted to a file
+    // lookup -- taking most of Europe, the UK, Australia and NZ with it.
+    const uk = parsePosixRule("GMT0BST,M3.5.0/1,M10.5.0").?;
+    const jul = daysFromCivil(2026, 7, 15) * 86400;
+    try testing.expectEqual(@as(i32, 3600), uk.offsetAt(jul));
+
+    const cet = parsePosixRule("CET-1CEST,M3.5.0,M10.5.0/3").?;
+    try testing.expectEqual(@as(i32, 2 * 3600), cet.offsetAt(jul));
+
+    // Southern hemisphere: DST spans the year boundary.
+    const syd = parsePosixRule("AEST-10AEDT,M10.1.0,M4.1.0/3").?;
+    const jan = daysFromCivil(2026, 1, 15) * 86400;
+    try testing.expectEqual(@as(i32, 11 * 3600), syd.offsetAt(jan));
+    try testing.expectEqual(@as(i32, 10 * 3600), syd.offsetAt(jul));
 }
 
-test "weekday and M-rule land on the right day" {
+test "POSIX: unparseable forms yield null, never a guess" {
+    try testing.expectEqual(@as(?PosixRule, null), parsePosixRule("EST5EDT,J60,J300")); // J-form
+    try testing.expectEqual(@as(?PosixRule, null), parsePosixRule("XYZ500000")); // hours out of range
+    try testing.expectEqual(@as(?PosixRule, null), parsePosixRule("XYZ600000")); // would overflow i32
+    try testing.expectEqual(@as(?PosixRule, null), parsePosixRule("%%%"));
+    try testing.expectEqual(@as(?PosixRule, null), parsePosixRule("America/Chicago")); // a zone name
+    try testing.expectEqual(@as(?PosixRule, null), parsePosixRule("EST5EDT,M3.2.0,M11.1.0junk"));
+}
+
+test "POSIX: offsets stay inside the RFC range" {
+    const r = parsePosixRule("XYZ24").?; // 24h west is the extreme legal value
+    try testing.expect(r.std_off >= min_utoff and r.std_off <= max_utoff);
+}
+
+test "civil date helpers" {
     try testing.expectEqual(@as(i32, 4), weekday(1970, 1, 1)); // Thursday
-    // Second Sunday of March 2026 is the 8th.
-    const r = PosixRule.MRule{ .month = 3, .week = 2, .day = 0, .secs = 0 };
-    try testing.expectEqual(daysFromCivil(2026, 3, 8) * 86400, instantOf(r, 2026));
-    // "Week 5" means the last such weekday: last Sunday of March 2026 is the 29th.
+    try testing.expectEqual(@as(i64, -365), daysFromCivil(1969, 1, 1));
+    try testing.expectEqual(@as(i32, 1969), yearOf(-1));
+    // Second Sunday of March 2026 is the 8th; the last is the 29th.
+    const second = PosixRule.MRule{ .month = 3, .week = 2, .day = 0, .secs = 0 };
     const last = PosixRule.MRule{ .month = 3, .week = 5, .day = 0, .secs = 0 };
+    try testing.expectEqual(daysFromCivil(2026, 3, 8) * 86400, instantOf(second, 2026));
     try testing.expectEqual(daysFromCivil(2026, 3, 29) * 86400, instantOf(last, 2026));
+}
+
+test "slim TZif: the footer rule governs instants past the last transition" {
+    // The shape that broke the previous implementation: a table whose last
+    // transition is decades old, plus a footer that carries the live rule.
+    // America/New_York's real table ends in 2007.
+    var timetypes = [_]std.tz.Timetype{
+        .{ .offset = -18000, .flags = 0, .name_data = "EST\x00\x00\x00".* },
+        .{ .offset = -14400, .flags = 1, .name_data = "EDT\x00\x00\x00".* },
+    };
+    var transitions = [_]std.tz.Transition{
+        .{ .ts = daysFromCivil(2007, 3, 11) * 86400, .timetype = &timetypes[1] },
+    };
+    const tz = std.tz.Tz{
+        .allocator = testing.allocator,
+        .transitions = &transitions,
+        .timetypes = &timetypes,
+        .leapseconds = &.{},
+        .footer = null,
+    };
+    const footer = parsePosixRule("EST5EDT,M3.2.0,M11.1.0");
+    const jan_2026 = daysFromCivil(2026, 1, 15) * 86400;
+    const jul_2026 = daysFromCivil(2026, 7, 15) * 86400;
+
+    // Without the footer the stale DST transition wins forever -- the bug.
+    try testing.expectEqual(@as(i32, -14400), tzifOffset(tz, null, jan_2026));
+    // With it, January is correctly EST and July correctly EDT.
+    try testing.expectEqual(@as(i32, -18000), tzifOffset(tz, footer, jan_2026));
+    try testing.expectEqual(@as(i32, -14400), tzifOffset(tz, footer, jul_2026));
+}
+
+test "TZif lookup: before the first transition uses the first standard type" {
+    var timetypes = [_]std.tz.Timetype{
+        .{ .offset = -14400, .flags = 1, .name_data = "EDT\x00\x00\x00".* },
+        .{ .offset = -18000, .flags = 0, .name_data = "EST\x00\x00\x00".* },
+    };
+    var transitions = [_]std.tz.Transition{
+        .{ .ts = 1000, .timetype = &timetypes[0] },
+    };
+    const tz = std.tz.Tz{
+        .allocator = testing.allocator,
+        .transitions = &transitions,
+        .timetypes = &timetypes,
+        .leapseconds = &.{},
+        .footer = null,
+    };
+    try testing.expectEqual(@as(i32, -18000), tzifOffset(tz, null, 999)); // first non-DST
+    try testing.expectEqual(@as(i32, -14400), tzifOffset(tz, null, 1000)); // at the transition
 }

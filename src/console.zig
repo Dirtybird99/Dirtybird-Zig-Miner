@@ -60,8 +60,19 @@ fn nowLocal() LocalTime {
         // UTC and the formatter appends 'Z' rather than implying local time.
         const ms_total = std.time.milliTimestamp();
         const utc_secs = @divFloor(ms_total, 1000);
-        const off: ?i32 = tz.offsetAt(utc_secs);
-        const secs: u64 = @intCast(utc_secs + (off orelse 0));
+        var off: ?i32 = tz.offsetAt(utc_secs);
+        // std.time.epoch is epoch-relative and unsigned: a pre-1970 instant
+        // would make @intCast illegal behaviour (UB in the ReleaseFast build
+        // we ship). An unsynced RTC on a freshly booted phone or SBC reports
+        // ~0, which any western offset pushes negative -- so drop the offset
+        // and mark the line rather than trusting the arithmetic.
+        var shifted = utc_secs + (off orelse 0);
+        if (shifted < 0) {
+            off = null;
+            shifted = utc_secs;
+        }
+        if (shifted < 0) shifted = 0;
+        const secs: u64 = @intCast(shifted);
         const es = std.time.epoch.EpochSeconds{ .secs = secs };
         const yd = es.getEpochDay().calculateYearDay();
         const md = yd.calculateMonthDay();
