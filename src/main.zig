@@ -10,6 +10,7 @@ const config = @import("config.zig");
 const console = @import("console.zig");
 const pages = @import("pages.zig");
 const cpu_features = @import("cpu_features.zig");
+const sha_mb = @import("sha256_mb.zig");
 const build_options = @import("build_options");
 
 const VERSION = build_options.version;
@@ -128,7 +129,17 @@ fn selftest(alloc: std.mem.Allocator) !u8 {
     var hex: [64]u8 = undefined;
     const pass = try powKat(alloc, &hex);
     std.debug.print("selftest pow(a): {s} {s}\n", .{ hex, if (pass) "PASS" else "FAIL" });
-    return if (pass) 0 else 1;
+
+    // The KAT above only covers hash1. The mining loop calls hash2, and a
+    // correct digest cannot by itself prove the accelerated backend ran -- so
+    // name the backend and differential-check the real path against std.
+    std.debug.print("selftest sha backend: {s}\n", .{sha_mb.backendName()});
+    const buf = try alloc.alloc(u8, sha_mb.parity_buf_len);
+    defer alloc.free(buf);
+    const parity = sha_mb.parityCheck(buf);
+    std.debug.print("selftest sha hash2 parity: {s}\n", .{if (parity) "PASS" else "FAIL"});
+
+    return if (pass and parity) 0 else 1;
 }
 
 /// `--bench`: AstroBWTv3 hashrate benchmark (Go dero-miner `--testnet`/bench path runs

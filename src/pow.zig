@@ -90,7 +90,7 @@ pub fn hash(input: []const u8, out: *[32]u8, w: *Worker) !void {
 /// Batched 2-nonce hash: builds both suffix arrays, then hashes them with a
 /// multi-buffer SHA-256 (latency-hiding) -- the SHA stage is ~24% of the hash and
 /// single-stream SHA-NI is latency-bound, so 2-way buys most of a 2x there.
-/// Placeholder uses two single-stream SHAs until sha256_mb lands; swap then.
+/// Both suffix arrays are built, then hashed through the multi-buffer SHA.
 pub fn hash2(in0: []const u8, in1: []const u8, out0: *[32]u8, out1: *[32]u8, w0: *Worker, w1: *Worker) !void {
     try computeSA(in0, w0);
     try computeSA(in1, w1);

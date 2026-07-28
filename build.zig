@@ -46,6 +46,47 @@ fn addSaDeps(c: *std.Build.Step.Compile, b: *std.Build, pgo: []const u8, profile
     c.linkLibCpp();
 }
 
+// ARMv8 crypto-extension SHA-256, compiled as its own object.
+//
+// std's Sha256 has a NEON sha256h/sha256su implementation gated at comptime on
+// the `.sha2` CPU feature, but `aarch64-linux-musl` resolves to the `generic`
+// model, which lacks it -- so every ARM build ran software SHA-256. Zig has no
+// per-function target features, so the only way to emit those instructions from
+// a baseline binary is a separate compilation unit that carries the feature.
+// The call is guarded at runtime by a HWCAP probe (sha256_mb.armSha2Available),
+// so the single arm64 artifact still runs on cores without the extension.
+//
+// Skipped when the main target already has `.sha2` (an explicit -Dcpu, or
+// aarch64-macos, which baselines to apple_m1): std is already accelerated there
+// and sha256_mb won't reference the extern.
+fn addArmSha(
+    b: *std.Build,
+    art: *std.Build.Step.Compile,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    want_pie: bool,
+) void {
+    if (target.result.cpu.arch != .aarch64) return;
+    if (std.Target.aarch64.featureSetHas(target.result.cpu.features, .sha2)) return;
+
+    const hw_target = b.resolveTargetQuery(.{
+        .cpu_arch = .aarch64,
+        .os_tag = target.result.os.tag,
+        .abi = target.result.abi,
+        // `.sha2` alone, not `.crypto` -- the latter also drags in `.aes`.
+        .cpu_features_add = std.Target.aarch64.featureSet(&.{.sha2}),
+    });
+    const obj = b.addObject(.{
+        .name = "sha256_hw_arm",
+        .root_source_file = b.path("src/sha256_hw_arm.zig"),
+        .target = hw_target,
+        .optimize = optimize,
+    });
+    // The miner is PIE on aarch64-linux; a non-PIC object would not relocate.
+    if (want_pie) obj.root_module.pic = true;
+    art.addObject(obj);
+}
+
 pub fn build(b: *std.Build) void {
     // Default to the best-performance configuration so a bare `zig build` (no flags)
     // produces the fastest binary: ReleaseFast, the x86_64_v3+sha baseline on x86_64
@@ -95,6 +136,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     if (want_pie) exe.pie = true;
+    addArmSha(b, exe, target, optimize, want_pie);
     exe.root_module.addOptions("build_options", build_options);
     // The miner is fully pure Zig -- no addSaDeps, no libc/libcpp, no C toolchain.
     b.installArtifact(exe);
@@ -114,6 +156,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     if (want_pie) bench.pie = true;
+    addArmSha(b, bench, target, optimize, want_pie);
     b.installArtifact(bench);
     const bench_run = b.addRunArtifact(bench);
     if (b.args) |args| bench_run.addArgs(args);
@@ -131,6 +174,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     if (want_pie) bench2.pie = true;
+    addArmSha(b, bench2, target, optimize, want_pie);
     b.installArtifact(bench2);
     const bench2_run = b.addRunArtifact(bench2);
     if (b.args) |args| bench2_run.addArgs(args);
@@ -147,6 +191,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     if (want_pie) p95.pie = true;
+    addArmSha(b, p95, target, optimize, want_pie);
     b.installArtifact(p95);
     const p95_run = b.addRunArtifact(p95);
     if (b.args) |args| p95_run.addArgs(args);
@@ -164,6 +209,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     if (want_pie) difftest.pie = true;
+    addArmSha(b, difftest, target, optimize, want_pie);
     b.installArtifact(difftest);
     const difftest_run = b.addRunArtifact(difftest);
     if (b.args) |args| difftest_run.addArgs(args);
@@ -177,6 +223,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     if (want_pie) tests.pie = true;
+    addArmSha(b, tests, target, optimize, want_pie);
     tests.root_module.addOptions("build_options", build_options);
     addSaDeps(tests, b, pgo, profile_rt);
     const tests_run = b.addRunArtifact(tests);

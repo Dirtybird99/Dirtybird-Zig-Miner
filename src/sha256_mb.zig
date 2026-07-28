@@ -77,6 +77,134 @@ const have_shani = builtin.cpu.arch == .x86_64 and
     builtin.zig_backend != .stage2_c and
     std.Target.x86.featureSetHasAll(builtin.cpu.features, .{ .sha, .avx2 });
 
+// ---------------------------------------------------------------------------
+// aarch64: ARMv8 crypto-extension SHA-256
+// ---------------------------------------------------------------------------
+// std's Sha256 emits sha256h/sha256su only when the compilation unit's target
+// carries the `.sha2` feature. The shipped arm64 target resolves to `generic`
+// (neon, no sha2), so every ARM build ran software SHA -- worth roughly 2-3x on
+// this workload, since the final SHA over ~275 KB of suffix array is ~21-24% of
+// a hash once accelerated. Zig has no per-function target features, so the
+// accelerated code is compiled into its own object with +sha2
+// (src/sha256_hw_arm.zig, wired up by addArmSha in build.zig) and reached
+// through the extern below, behind a runtime probe -- one artifact keeps
+// working on ARMv8 cores without the crypto extension.
+
+/// True when THIS unit already emits the NEON path (an explicit -Dcpu=...+sha2,
+/// or aarch64-macos, which baselines to apple_m1). Then std is already fast and
+/// no separate object is needed.
+const have_armv8_sha_builtin = builtin.cpu.arch == .aarch64 and
+    builtin.zig_backend != .stage2_c and
+    std.Target.aarch64.featureSetHas(builtin.cpu.features, .sha2);
+
+/// The +sha2 object is linked (and the extern below is resolvable) exactly when
+/// build.zig added it: aarch64 targets whose baseline lacks the feature.
+const arm_hw_linked = builtin.cpu.arch == .aarch64 and
+    builtin.zig_backend != .stage2_c and
+    !have_armv8_sha_builtin;
+
+extern fn dbzSha256ArmV8(in_ptr: [*]const u8, in_len: usize, out: *[32]u8) void;
+
+/// Linux `asm/hwcap.h`: HWCAP_SHA2. std has no HWCAP struct for aarch64.
+const HWCAP_SHA2: usize = 1 << 6;
+
+fn probeArmSha2() bool {
+    if (!arm_hw_linked) return false;
+    // Escape hatch, in the spirit of the family's --no-2way / -pair=false. It
+    // is also the only way to exercise the software fallback on a host that
+    // has the extension: qemu advertises SHA2 for every aarch64 CPU model, so
+    // there is otherwise no way to test the path a crypto-less core takes.
+    if (std.posix.getenv("DERO_NO_ARM_SHA") != null) return false;
+    return switch (builtin.os.tag) {
+        // Every Apple Silicon core has the crypto extensions.
+        .macos => true,
+        .linux => (std.os.linux.getauxval(std.elf.AT_HWCAP) & HWCAP_SHA2) != 0,
+        else => false,
+    };
+}
+
+var arm_hw_ok: bool = false;
+var arm_hw_once = std.once(initArmHw);
+
+fn initArmHw() void {
+    arm_hw_ok = probeArmSha2();
+}
+
+/// Whether the ARM hardware path may be called. Probed once; every mining
+/// thread hits this per hash, and the auxv walk must not race.
+pub fn armSha2Available() bool {
+    if (!arm_hw_linked) return false;
+    arm_hw_once.call();
+    return arm_hw_ok;
+}
+
+/// True when this build has a hardware SHA-256 path available right now, on
+/// either architecture. Used to decide whether the parity tests are meaningful.
+pub fn accelerated() bool {
+    return have_shani or have_armv8_sha_builtin or armSha2Available();
+}
+
+/// Which SHA-256 backend the miner will actually use. Printed by `--selftest`
+/// so CI can assert the accelerated path was taken -- a correct digest alone
+/// cannot distinguish hardware from the software fallback.
+pub fn backendName() []const u8 {
+    if (have_shani) return "sha-ni";
+    if (have_armv8_sha_builtin or armSha2Available()) return "armv8-sha2";
+    return "software";
+}
+
+/// Verify the production `hash2` path against std one-shot digests.
+///
+/// `--selftest`'s pow KAT only exercises `hash1`; the mining loop calls
+/// `hash2`. On aarch64 this is a genuine hardware-vs-software differential:
+/// `hash2` routes into the +sha2 object while the `std` reference in this unit
+/// is the baseline software implementation.
+///
+/// `buf` is caller-owned scratch (this file allocates nothing); it must be at
+/// least `parity_buf_len` bytes.
+pub const parity_buf_len: usize = 275354;
+
+pub fn parityCheck(buf: []u8) bool {
+    if (buf.len < parity_buf_len) return false;
+
+    var s: u32 = 0x12345678;
+    for (buf) |*b| {
+        s = s *% 1664525 +% 1013904223;
+        b.* = @truncate(s >> 24);
+    }
+
+    const small = [_]usize{ 0, 1, 55, 56, 63, 64, 65, 127, 128, 129, 4096 };
+    for (small) |n0| {
+        for (small) |n1| {
+            if (!parityPair(buf, n0, n1)) return false;
+        }
+    }
+    // Full suffix-array-sized messages: the shape the miner actually hashes.
+    const big = [_][2]usize{
+        .{ parity_buf_len, parity_buf_len },
+        .{ parity_buf_len, 4096 },
+        .{ 4096, parity_buf_len },
+        .{ 274000, parity_buf_len },
+    };
+    for (big) |p| {
+        if (!parityPair(buf, p[0], p[1])) return false;
+    }
+    return true;
+}
+
+fn parityPair(buf: []u8, n0: usize, n1: usize) bool {
+    const m0 = buf[0..n0];
+    const m1 = buf[buf.len - n1 ..];
+    var got0: [32]u8 = undefined;
+    var got1: [32]u8 = undefined;
+    hash2(m0, m1, &got0, &got1);
+    var want0: [32]u8 = undefined;
+    var want1: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(m0, &want0, .{});
+    std.crypto.hash.sha2.Sha256.hash(m1, &want1, .{});
+    return std.mem.eql(u8, &got0, &want0) and std.mem.eql(u8, &got1, &want1);
+}
+
 /// One lane's running state: the 8 SHA-256 words, big-endian word order.
 pub const State = [8]u32;
 
@@ -818,8 +946,11 @@ inline fn finishOne(state: *State, msg: []const u8, done_blocks: usize) void {
     compress1(state, &pad, npad);
 }
 
-/// Scalar fallback (non-SHA-NI hosts): plain std SHA-256.
+/// Non-SHA-NI hosts. On aarch64 with the crypto extension this runs the ARMv8
+/// hardware path (separate +sha2 object, see the block near `have_shani`);
+/// everywhere else it is plain std SHA-256.
 fn hashStd(in: []const u8, out: *[32]u8) void {
+    if (armSha2Available()) return dbzSha256ArmV8(in.ptr, in.len, out);
     std.crypto.hash.sha2.Sha256.hash(in, out, .{});
 }
 
@@ -928,7 +1059,7 @@ fn fillPattern(buf: []u8, seed: u64) void {
 }
 
 test "hash1 parity vs std over boundary sizes" {
-    if (!have_shani) return error.SkipZigTest;
+    if (!accelerated()) return error.SkipZigTest;
     const max = 275354;
     const buf = try testing.allocator.alloc(u8, max);
     defer testing.allocator.free(buf);
@@ -944,7 +1075,7 @@ test "hash1 parity vs std over boundary sizes" {
 }
 
 test "hash2 parity vs std over boundary size pairs" {
-    if (!have_shani) return error.SkipZigTest;
+    if (!accelerated()) return error.SkipZigTest;
     const max = 275354;
     const a = try testing.allocator.alloc(u8, max);
     defer testing.allocator.free(a);
@@ -969,7 +1100,7 @@ test "hash2 parity vs std over boundary size pairs" {
 }
 
 test "hash4 parity vs std over boundary size quads" {
-    if (!have_shani) return error.SkipZigTest;
+    if (!accelerated()) return error.SkipZigTest;
     const max = 275354;
     var bufs: [4][]u8 = undefined;
     inline for (0..4) |i| {
@@ -998,7 +1129,7 @@ test "hash4 parity vs std over boundary size quads" {
 }
 
 test "hash2 / hash4 random fuzz" {
-    if (!have_shani) return error.SkipZigTest;
+    if (!accelerated()) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(0xA5A5_1234_9999_0001);
     const rnd = prng.random();
     const max = 4500;
