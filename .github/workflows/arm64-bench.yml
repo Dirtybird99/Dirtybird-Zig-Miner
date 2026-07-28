@@ -50,14 +50,31 @@ jobs:
           grep -qw sha2 /proc/cpuinfo \
             || { echo 'ERROR: runner CPU lacks the sha2 hwcap -- the comparison would be meaningless'; exit 1; }
 
-      - name: Build (native) and confirm the accelerated path is live
+      # Build the configuration we actually SHIP (aarch64-linux-musl, generic
+      # CPU), not -Dcpu=native. On a runner whose CPU has sha2, `native` puts
+      # .sha2 on the main compilation unit -- std is then accelerated directly,
+      # the separate +sha2 object is never linked, and DERO_NO_ARM_SHA becomes
+      # inert. A run built that way measures hardware against hardware and
+      # reports a dead heat, which is exactly what the first run of this
+      # workflow did.
+      - name: Build the shipped arm64 configuration
         run: |
-          zig build bench -Doptimize=ReleaseFast -Dcpu=native
-          zig build -Doptimize=ReleaseFast -Dcpu=native
+          zig build bench -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl
+          zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl
+
+      # Prove the two arms are actually different before any timing is trusted.
+      - name: Prove the A/B control works
+        run: |
           # 2>&1: the selftest reports on stderr.
           ./zig-out/bin/zig-miner --selftest 2>&1 | tee selftest.log
-          grep -q 'sha backend: armv8-sha2' selftest.log
+          grep -q 'sha backend: armv8-sha2' selftest.log \
+            || { echo 'ERROR: hardware arm is not using ARMv8 SHA -- nothing to measure'; exit 1; }
           grep -q 'hash2 parity: PASS' selftest.log
+
+          DERO_NO_ARM_SHA=1 ./zig-out/bin/zig-miner --selftest 2>&1 | tee selftest-software.log
+          grep -q 'sha backend: software' selftest-software.log \
+            || { echo 'ERROR: control arm still ran hardware SHA -- the A/B would be meaningless'; exit 1; }
+          grep -q 'hash2 parity: PASS' selftest-software.log
 
       # One binary, both arms: DERO_NO_ARM_SHA=1 forces the software fallback,
       # so the SHA backend is the only thing that differs between the two
@@ -82,6 +99,7 @@ jobs:
           name: arm64-bench
           path: |
             selftest.log
+            selftest-software.log
             bench-*.log
           if-no-files-found: ignore
           overwrite: true
