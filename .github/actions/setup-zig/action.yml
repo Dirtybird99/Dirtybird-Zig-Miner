@@ -27,10 +27,15 @@ runs:
       run: |
         set -euo pipefail
         VER="${{ inputs.version }}"
-        case "${{ runner.os }}" in
-          Linux) ARCH="x86_64-linux" ;;
-          macOS) ARCH="aarch64-macos" ;;
-          *) echo "unsupported runner OS"; exit 1 ;;
+        # Key off the machine, not just the OS: the arm64-bench workflow runs on
+        # ubuntu-24.04-arm, where an x86_64 tarball installs fine and then dies
+        # with "cannot execute binary file: Exec format error".
+        case "${{ runner.os }}/$(uname -m)" in
+          Linux/x86_64) ARCH="x86_64-linux" ;;
+          Linux/aarch64) ARCH="aarch64-linux" ;;
+          macOS/arm64) ARCH="aarch64-macos" ;;
+          macOS/x86_64) ARCH="x86_64-macos" ;;
+          *) echo "unsupported runner: ${{ runner.os }}/$(uname -m)"; exit 1 ;;
         esac
         DIR="zig-${ARCH}-${VER}"
         curl -fsSL -o zig.tar.xz "https://ziglang.org/download/${VER}/${DIR}.tar.xz"
