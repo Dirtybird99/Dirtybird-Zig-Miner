@@ -20,6 +20,7 @@ test {
     _ = @import("state.zig");
     _ = @import("miner.zig");
     _ = @import("net.zig");
+    _ = @import("dns.zig");
     _ = @import("pages.zig");
     _ = @import("cpu_features.zig");
     _ = @import("console.zig");
