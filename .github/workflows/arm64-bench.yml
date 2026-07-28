@@ -54,7 +54,8 @@ jobs:
         run: |
           zig build bench -Doptimize=ReleaseFast -Dcpu=native
           zig build -Doptimize=ReleaseFast -Dcpu=native
-          ./zig-out/bin/zig-miner --selftest | tee selftest.log
+          # 2>&1: the selftest reports on stderr.
+          ./zig-out/bin/zig-miner --selftest 2>&1 | tee selftest.log
           grep -q 'sha backend: armv8-sha2' selftest.log
           grep -q 'hash2 parity: PASS' selftest.log
 

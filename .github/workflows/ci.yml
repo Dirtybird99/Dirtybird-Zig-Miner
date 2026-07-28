@@ -82,7 +82,9 @@ jobs:
             || { echo 'ERROR: no ARMv8 SHA-256 instructions -- the +sha2 object did not link'; exit 1; }
 
           # KAT (hash1) + backend identity + hash2 differential (the mining path).
-          qemu-aarch64-static "$BIN" --selftest | tee arm64-selftest.log
+          # 2>&1: the selftest reports on stderr (std.debug.print), so a bare
+          # pipe would tee an empty file and every grep below would fail.
+          qemu-aarch64-static "$BIN" --selftest 2>&1 | tee arm64-selftest.log
           grep -q 'pow(a): .* PASS' arm64-selftest.log
           grep -q 'sha backend: armv8-sha2' arm64-selftest.log \
             || { echo 'ERROR: runtime did not select the ARMv8 SHA path'; exit 1; }
@@ -90,7 +92,7 @@ jobs:
 
           # The software fallback a crypto-less core would take must still be
           # correct -- qemu advertises SHA2 on every model, so force it.
-          DERO_NO_ARM_SHA=1 qemu-aarch64-static "$BIN" --selftest | tee arm64-fallback.log
+          DERO_NO_ARM_SHA=1 qemu-aarch64-static "$BIN" --selftest 2>&1 | tee arm64-fallback.log
           grep -q 'sha backend: software' arm64-fallback.log
           grep -q 'pow(a): .* PASS' arm64-fallback.log
           grep -q 'hash2 parity: PASS' arm64-fallback.log
