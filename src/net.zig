@@ -862,7 +862,17 @@ fn handleFrame(
 /// during a grown backoff doesn't lag the join (mirrors the C's backoff_sleep).
 fn backoffSleep(hooks: Hooks, ms: i64) void {
     const SLICE: i64 = 250;
+    // Spread the wake-up over +/-25%. The usual reason is thundering-herd, but
+    // there is a sharper one here: an unjittered backoff let anyone who drops
+    // the session predict the next resolve to within tens of milliseconds. That
+    // is what made the old dns.zig query id -- an LCG seeded from
+    // milliTimestamp() -- enumerable down to ~100 candidates. The id is CSPRNG
+    // now; keeping the instant unpredictable too removes the other half.
     var remaining = ms;
+    if (remaining > 0) {
+        remaining = (ms - @divTrunc(ms, 4)) +
+            std.crypto.random.intRangeAtMost(i64, 0, @divTrunc(ms, 2));
+    }
     while (remaining > 0 and !hooks.should_quit(hooks.ctx)) {
         const slice = @min(remaining, SLICE);
         std.time.sleep(@as(u64, @intCast(slice)) * std.time.ns_per_ms);
