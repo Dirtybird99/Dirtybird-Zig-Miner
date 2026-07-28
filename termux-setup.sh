@@ -33,6 +33,41 @@ info() { printf '%s[*]%s %s\n' "$G" "$Z" "$*"; }
 warn() { printf '%s[!]%s %s\n' "$Y" "$Z" "$*"; }
 die()  { printf '%s[x]%s %s\n' "$R" "$Z" "$*" >&2; exit 1; }
 
+usage() {
+  cat <<EOF
+Dirtybird Zig Miner -- one-shot Termux (Android) installer.
+
+Usage:
+  curl -fsSL https://raw.githubusercontent.com/$REPO/main/termux-setup.sh | bash
+  bash termux-setup.sh [-h|--help]
+
+Installs the latest release into \$HOME/$NAME (an exec-capable filesystem --
+/sdcard is noexec on Android), prompts for daemon/pool, wallet and threads,
+writes config.json, holds a wake-lock, and starts mining.
+
+Re-run to update: the installed version is compared against the latest release,
+and an existing config.json is offered as the default at every prompt.
+
+Options:
+  -h, --help    show this message and exit
+EOF
+}
+
+# No flags beyond --help, but the arguments still have to be inspected: with no
+# parsing at all, `termux-setup.sh --help` silently performed a full install.
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  "") ;;
+  *) printf 'unknown argument: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+esac
+
+# A DERO address is 66 characters. The miner only checks the wallet is
+# non-empty, so this is the sole guard against a truncated paste -- which
+# otherwise mines to nobody until someone notices hours later.
+valid_wallet() {
+  [[ "$1" =~ ^(dero1|deto1)[a-z0-9]{60,}$ ]]
+}
+
 valid_endpoint() {
   local value="$1" host port label
   local -a labels
@@ -214,8 +249,16 @@ if [ -t "$PROMPT_FD" ]; then
   choose_endpoint "$CUR_ADDR"
   printf '\n%sDERO wallet address%s (for solo/pool payouts)\n' "$C" "$Z"
   [ -n "$CUR_WALLET" ] && printf '  Press Enter to keep: %s%s%s\n' "$G" "$CUR_WALLET" "$Z"
-  read -r -u "$PROMPT_FD" -p "  Wallet: " IN_WALLET || true
-  WALLET="${IN_WALLET:-$CUR_WALLET}"
+  while true; do
+    read -r -u "$PROMPT_FD" -p "  Wallet: " IN_WALLET || true
+    WALLET="${IN_WALLET:-$CUR_WALLET}"
+    valid_wallet "$WALLET" && break
+    if [ -z "$WALLET" ]; then
+      warn "A wallet address is required -- payouts have nowhere to go without one."
+    else
+      warn "That does not look like a DERO address (dero1/deto1 + 60 or more lowercase alphanumerics)."
+    fi
+  done
 
   printf '\n%sThreads%s (%s cores detected, 1 reserved for OS)\n' "$C" "$Z" "$CORES"
   read -r -u "$PROMPT_FD" -p "  Threads [${SUGGEST_T}]: " IN_T || true
@@ -223,6 +266,14 @@ if [ -t "$PROMPT_FD" ]; then
 else
   warn "non-interactive shell -- using existing/default config."
   ADDR="$CUR_ADDR"; WALLET="$CUR_WALLET"; THREADS="$CUR_THREADS"
+  # Nothing can be prompted for here, so an absent wallet is fatal rather than a
+  # silent install that mines to nobody. A present-but-odd one only warns: it
+  # may be a working setup this check does not recognise.
+  if [ -z "$WALLET" ]; then
+    die "no wallet in config.json and no terminal to prompt from -- run this interactively once."
+  elif ! valid_wallet "$WALLET"; then
+    warn "wallet in config.json does not look like a DERO address; leaving it as-is."
+  fi
 fi
 
 # integer-guard threads
