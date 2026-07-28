@@ -252,9 +252,27 @@ const RateWindow = struct {
     }
 };
 
-const StatusLayout = enum { full, compact, minimal };
+/// The family's five rungs, widest first. Shared byte-for-byte with the C++,
+/// Rust and Go miners: same field sets, same labels, same separators, same
+/// colour-to-field mapping. Do not reshape one of these without changing all
+/// four -- the conformance fixture below is the same table in every repo.
+const StatusLayout = enum { full, medium, narrow, compact, minimal };
+
+const status_ladder = [_]StatusLayout{ .full, .medium, .narrow, .compact, .minimal };
+
+/// `DIRTYBIRD_COLS` overrides the width probe, for setups where the ioctl
+/// reports 0 (some CI pty wrappers, a few Android terminals). Checked first so
+/// it works even where the probe would have succeeded.
+fn envColumns() ?usize {
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const raw = std.process.getEnvVarOwned(fba.allocator(), "DIRTYBIRD_COLS") catch return null;
+    const v = std.fmt.parseInt(usize, std.mem.trim(u8, raw, " \t\r\n"), 10) catch return null;
+    return if (v > 0 and v < 10000) v else null;
+}
 
 fn terminalColumns() usize {
+    if (envColumns()) |v| return v;
     if (builtin.os.tag == .windows) {
         var info: std.os.windows.CONSOLE_SCREEN_BUFFER_INFO = undefined;
         if (std.os.windows.kernel32.GetConsoleScreenBufferInfo(std.io.getStdErr().handle, &info) != std.os.windows.FALSE) {
@@ -273,7 +291,11 @@ fn terminalColumns() usize {
         );
         if (std.posix.errno(result) == .SUCCESS and size.col > 0) return size.col;
     }
-    return 40;
+    // 80, not 40: "console of unknown size" is a real case (Git Bash/mintty
+    // report a terminal but fail the size query on a pty handle), and assuming
+    // a classic 80 keeps the line on one row there. Assuming narrow instead
+    // just discards fields nobody asked to lose. The siblings agree on 80.
+    return 80;
 }
 
 fn visibleWidth(line: []const u8) usize {
@@ -292,12 +314,18 @@ fn visibleWidth(line: []const u8) usize {
     return width;
 }
 
-fn renderStatusLayout(
-    buf: []u8,
-    stats: ReportStats,
-    layout: StatusLayout,
-    include_verbose: bool,
-) ![]const u8 {
+/// Render one rung. Every SGR sits immediately before the run it colours, and a
+/// separator is emitted in Text with the escape preceding it -- so the tag runs
+/// straight into the rate with no Text escape between them, and the final field
+/// is followed *directly* by Reset. That last detail is load-bearing: this used
+/// to emit a trailing A_BWHITE before the reset, giving FULL 17 SGR sequences
+/// where the C++ and Rust miners emit 16. It is invisible on screen (a colour
+/// set immediately before a reset is a no-op), so only a byte test catches it.
+/// Go inherited the same extra escape from this function.
+///
+/// The reject colour is the only value-dependent escape, and MINIMAL is the one
+/// rung that carries no reject field -- so its bytes are reject-independent.
+fn renderStatusLayout(buf: []u8, stats: ReportStats, layout: StatusLayout) ![]const u8 {
     const rejcol = if (stats.rejected > 0) A_BRED else A_WHITE;
     var stream = std.io.fixedBufferStream(buf);
     const writer = stream.writer();
@@ -314,28 +342,85 @@ fn renderStatusLayout(
             try writer.print(" | {s}Blocks:{d}{s}", .{ A_GREEN, stats.blocks, A_BWHITE });
             try writer.print(" | {s}REJ:{d}{s}", .{ rejcol, stats.rejected, A_BWHITE });
             try writer.print(" | {s}Diff:{s}{s}", .{ A_MAGENTA, stats.diff, A_BWHITE });
-            try writer.print(" | {s}{d:0>2}:{d:0>2}:{d:0>2}{s}", .{ A_WHITE, stats.hh, stats.mm, stats.ss, A_BWHITE });
+            try writer.print(" | {s}{d:0>2}:{d:0>2}:{d:0>2}", .{ A_WHITE, stats.hh, stats.mm, stats.ss });
+        },
+        .medium => {
+            try writer.print("{s}[DIRTYBIRD] ", .{A_BYELLOW});
+            try writer.print("{s}{d:.2} KH/s{s} ({s}{d:.2} avg{s})", .{
+                A_BGREEN, stats.rate, A_BWHITE, A_GREEN, stats.avg, A_BWHITE,
+            });
+            try writer.print(" | {s}H:{d}{s}", .{ A_BLUE, stats.height, A_BWHITE });
+            try writer.print(" | {s}MB:{d}{s}", .{ A_CYAN, stats.accepted, A_BWHITE });
+            try writer.print(" | {s}B:{d}{s}", .{ A_GREEN, stats.blocks, A_BWHITE });
+            try writer.print(" | {s}R:{d}{s}", .{ rejcol, stats.rejected, A_BWHITE });
+            try writer.print(" | {s}D:{s}{s}", .{ A_MAGENTA, stats.diff, A_BWHITE });
+            try writer.print(" | {s}{d:0>2}:{d:0>2}:{d:0>2}", .{ A_WHITE, stats.hh, stats.mm, stats.ss });
+        },
+        .narrow => {
+            try writer.print("{s}[DIRTYBIRD] ", .{A_BYELLOW});
+            try writer.print("{s}{d:.2} KH/s{s}", .{ A_BGREEN, stats.rate, A_BWHITE });
+            try writer.print(" | {s}H:{d}{s}", .{ A_BLUE, stats.height, A_BWHITE });
+            try writer.print(" | {s}MB:{d}{s}", .{ A_CYAN, stats.accepted, A_BWHITE });
+            try writer.print(" | {s}B:{d}{s}", .{ A_GREEN, stats.blocks, A_BWHITE });
+            try writer.print(" | {s}R:{d}{s}", .{ rejcol, stats.rejected, A_BWHITE });
+            try writer.print(" | {s}D:{s}{s}", .{ A_MAGENTA, stats.diff, A_BWHITE });
+            try writer.print(" | {s}{d:0>2}:{d:0>2}:{d:0>2}", .{ A_WHITE, stats.hh, stats.mm, stats.ss });
         },
         .compact => {
-            try writer.print("{s}[DIRTYBIRD] {s}{d:.2} KH/s{s}", .{ A_BYELLOW, A_BGREEN, stats.rate, A_BWHITE });
-            try writer.print(" {s}H:{d}{s}", .{ A_BLUE, stats.height, A_BWHITE });
-            try writer.print(" {s}M:{d}{s}", .{ A_CYAN, stats.accepted, A_BWHITE });
+            try writer.print("{s}[DB] ", .{A_BYELLOW});
+            try writer.print("{s}{d:.2} KH/s{s}", .{ A_BGREEN, stats.rate, A_BWHITE });
+            try writer.print(" | {s}H:{d}{s}", .{ A_BLUE, stats.height, A_BWHITE });
+            try writer.print(" {s}MB:{d}{s}", .{ A_CYAN, stats.accepted, A_BWHITE });
             try writer.print(" {s}B:{d}{s}", .{ A_GREEN, stats.blocks, A_BWHITE });
             try writer.print(" {s}R:{d}{s}", .{ rejcol, stats.rejected, A_BWHITE });
+            try writer.print(" | {s}{d:0>2}:{d:0>2}:{d:0>2}", .{ A_WHITE, stats.hh, stats.mm, stats.ss });
         },
         .minimal => {
-            try writer.print("{s}{d:.2} KH/s{s} {s}H:{d}{s}", .{
-                A_BGREEN, stats.rate, A_BWHITE, A_BLUE, stats.height, A_BWHITE,
-            });
+            try writer.print("{s}[DB] ", .{A_BYELLOW});
+            try writer.print("{s}{d:.2} KH/s{s}", .{ A_BGREEN, stats.rate, A_BWHITE });
+            try writer.print(" {s}MB:{d}{s}", .{ A_CYAN, stats.accepted, A_BWHITE });
+            try writer.print(" {s}B:{d}", .{ A_GREEN, stats.blocks });
         },
     }
-    if (include_verbose) {
-        try writer.print(" | funnel submitted:{d} acc:{d} rej:{d} stale:{d} sendfail:{d}", .{
-            stats.submitted, stats.accepted, stats.rejected, stats.stale_drops, stats.submit_drops,
-        });
-    }
+    // Reset before erase: erase-to-EOL fills with the *active* SGR background,
+    // so erasing first would paint a coloured bar the day a background is added.
     try writer.print("{s}{s}", .{ A_RESET, A_CLREOL });
     return stream.getWritten();
+}
+
+/// Copy `line` into `out`, keeping every complete CSI sequence and every control
+/// byte (neither costs a column) and dropping printable bytes once `budget`
+/// visible columns have been emitted. Byte-truncating a coloured line can cut an
+/// escape in half, which wedges the terminal's colour state and prints the
+/// escape's tail as literal text -- so the trailing reset and erase always
+/// survive. This is the C miner's `ansi_clamp`.
+fn ansiClamp(out: []u8, line: []const u8, budget: usize) []const u8 {
+    var w: usize = 0;
+    var vis: usize = 0;
+    var i: usize = 0;
+    while (i < line.len) {
+        if (line[i] == '\x1b' and i + 1 < line.len and line[i + 1] == '[') {
+            var j = i + 2;
+            while (j < line.len and !(line[j] >= 0x40 and line[j] <= 0x7e)) : (j += 1) {}
+            if (j < line.len) j += 1;
+            const seq = line[i..j];
+            if (w + seq.len > out.len) return out[0..w];
+            @memcpy(out[w..][0..seq.len], seq);
+            w += seq.len;
+            i = j;
+        } else {
+            const b = line[i];
+            const keep = b < 0x20 or vis < budget;
+            if (keep) {
+                if (w + 1 > out.len) return out[0..w];
+                out[w] = b;
+                w += 1;
+                if (b >= 0x20) vis += 1;
+            }
+            i += 1;
+        }
+    }
+    return out[0..w];
 }
 
 fn formatStatusLine(buf: []u8, stats: ReportStats, tty: bool, columns: usize) []const u8 {
@@ -350,29 +435,25 @@ fn formatStatusLineChecked(buf: []u8, stats: ReportStats, tty: bool, columns: us
             "[DIRTYBIRD] {d:.2} KH/s ({d:.2} KH/s avg) | Height:{d} | Miniblocks:{d} | Blocks:{d} | REJ:{d} | Diff:{s} | {d:0>2}:{d:0>2}:{d:0>2}",
             .{ stats.rate, stats.avg, stats.height, stats.accepted, stats.blocks, stats.rejected, stats.diff, stats.hh, stats.mm, stats.ss },
         );
-        if (stats.verbose) {
-            try writer.print(" | funnel submitted:{d} acc:{d} rej:{d} stale:{d} sendfail:{d}", .{
-                stats.submitted, stats.accepted, stats.rejected, stats.stale_drops, stats.submit_drops,
-            });
-        }
         try writer.writeByte('\n');
         return stream.getWritten();
     }
 
-    const budget = if (columns > 0) columns - 1 else 0;
-    for ([_]StatusLayout{ .full, .compact, .minimal }) |layout| {
-        const line = try renderStatusLayout(buf, stats, layout, layout == .full and stats.verbose);
+    // `columns == 0` means "width unknown", which is UNBOUNDED -- select FULL.
+    // It used to mean budget 0, i.e. clip everything away. Note this is a pure
+    // width question: whether we have a terminal at all is the `tty` argument,
+    // and conflating the two is what makes a shared fixture unportable.
+    const budget = if (columns > 0) columns - 1 else std.math.maxInt(usize);
+    for (status_ladder) |layout| {
+        const line = try renderStatusLayout(buf, stats, layout);
         if (visibleWidth(line) <= budget) return line;
-        if (layout == .full and stats.verbose) {
-            const without_verbose = try renderStatusLayout(buf, stats, .full, false);
-            if (visibleWidth(without_verbose) <= budget) return without_verbose;
-        }
     }
 
-    var minimal_buf: [256]u8 = undefined;
-    const minimal = try std.fmt.bufPrint(&minimal_buf, "{d:.2} KH/s H:{d}", .{ stats.rate, stats.height });
-    const clipped = minimal[0..@min(minimal.len, budget)];
-    return std.fmt.bufPrint(buf, "\r{s}{s}", .{ clipped, A_CLREOL });
+    // Narrower than the smallest rung: re-render MINIMAL *with* colour and clamp
+    // it escape-aware, so the trailing reset and erase survive.
+    var minimal_buf: [512]u8 = undefined;
+    const minimal = try renderStatusLayout(&minimal_buf, stats, .minimal);
+    return ansiClamp(buf, minimal, budget);
 }
 
 fn reporter() void {
@@ -403,7 +484,10 @@ fn reporter() void {
         var dbuf: [24]u8 = undefined;
         const diff = fmtDiff(&dbuf, G.difficulty.load(.monotonic));
 
-        var line_buf: [1024]u8 = undefined;
+        // Five rungs of worst-case u64 fields plus 16 SGR sequences; 1024 was
+        // sized for three rungs and would degrade to a bare "\r\x1b[K" on
+        // overflow rather than narrowing.
+        var line_buf: [2048]u8 = undefined;
         const line = formatStatusLine(&line_buf, .{
             .rate = rate,
             .avg = avg,
@@ -421,6 +505,18 @@ fn reporter() void {
             .submit_drops = G.submit_drops.load(.monotonic),
         }, g_status_tty, if (g_status_tty) terminalColumns() else 0);
         std.debug.print("{s}", .{line});
+
+        // The funnel is a separate record, never part of the status line. When
+        // it lived inside the line it was counted as columns, so -v could push
+        // FULL past its width and silently select a narrower rung than the
+        // terminal could actually hold -- and it landed after the reset, so the
+        // line no longer ended with one. C++ and Rust both keep it outside.
+        if (g_verbose) {
+            console.logLine("INFO", "funnel submitted:{d} acc:{d} rej:{d} stale:{d} sendfail:{d}", .{
+                G.submitted.load(.monotonic),   accepted,                        rejected,
+                G.stale_drops.load(.monotonic), G.submit_drops.load(.monotonic),
+            });
+        }
     }
 }
 
@@ -478,81 +574,249 @@ test "formatStatusLine rewrites one colored TTY row" {
     try std.testing.expect(std.mem.endsWith(u8, line, A_RESET ++ A_CLREOL));
 }
 
-test "formatStatusLine selects a layout that fits each terminal width" {
-    const stats = ReportStats{
-        .rate = 23.76,
-        .avg = 20.71,
-        .height = 7212998,
-        .accepted = 1998,
-        .blocks = 262,
-        .rejected = 4,
-        .diff = "312M",
-        .hh = 1,
-        .mm = 2,
-        .ss = 3,
-    };
+// ===========================================================================
+// Status-line conformance fixture.
+//
+// THE SAME TABLE LIVES IN ALL FOUR MINERS (C++ tools/replay/test_statusline.cpp,
+// Rust, Go, here). The four must render byte-identical visible payloads at every
+// width. If you change a rung here without changing the other three, this table
+// is what should stop you.
+//
+// Values are the C++ suite's "screenshot" case. The widths below are DATA, not
+// constants: they are what this fixture happens to measure. Never turn them into
+// hardcoded selection thresholds -- doing exactly that is what reintroduced
+// line-wrap in the C and Rust ports. Selection renders and measures.
+// ===========================================================================
 
-    for ([_]usize{ 200, 80, 56, 40, 12 }) |columns| {
-        var buf: [512]u8 = undefined;
-        const line = formatStatusLine(&buf, stats, true, columns);
-        try std.testing.expect(visibleWidth(line) <= columns - 1);
-        try std.testing.expect(std.mem.indexOfScalar(u8, line, '\n') == null);
+const fixture = ReportStats{
+    .rate = 0.00,
+    .avg = 4.96,
+    .height = 7368356,
+    .accepted = 962,
+    .blocks = 93,
+    .rejected = 25,
+    .diff = "795K",
+    .hh = 0,
+    .mm = 1,
+    .ss = 11,
+};
 
-        if (columns == 200) try std.testing.expect(std.mem.indexOf(u8, line, "Height:7212998") != null);
-        if (columns == 80 or columns == 56) {
-            try std.testing.expect(std.mem.indexOf(u8, line, "[DIRTYBIRD]") != null);
-            try std.testing.expect(std.mem.indexOf(u8, line, "M:1998") != null);
-        }
-        if (columns == 40) {
-            try std.testing.expect(std.mem.indexOf(u8, line, "[DIRTYBIRD]") == null);
-            try std.testing.expect(std.mem.indexOf(u8, line, "H:7212998") != null);
-        }
-        if (columns == 12) {
-            try std.testing.expect(std.mem.indexOf(u8, line, A_BGREEN) == null);
-            try std.testing.expect(std.mem.endsWith(u8, line, A_CLREOL));
+const fx_full = "[DIRTYBIRD] 0.00 KH/s (4.96 KH/s avg) | Height:7368356 | Miniblocks:962 | Blocks:93 | REJ:25 | Diff:795K | 00:01:11";
+const fx_medium = "[DIRTYBIRD] 0.00 KH/s (4.96 avg) | H:7368356 | MB:962 | B:93 | R:25 | D:795K | 00:01:11";
+const fx_narrow = "[DIRTYBIRD] 0.00 KH/s | H:7368356 | MB:962 | B:93 | R:25 | D:795K | 00:01:11";
+const fx_compact = "[DB] 0.00 KH/s | H:7368356 MB:962 B:93 R:25 | 00:01:11";
+const fx_minimal = "[DB] 0.00 KH/s MB:962 B:93";
+
+/// Drop every CSI sequence and control byte, leaving the visible payload.
+fn stripAnsi(out: []u8, line: []const u8) []const u8 {
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < line.len) {
+        if (line[i] == '\x1b' and i + 1 < line.len and line[i + 1] == '[') {
+            i += 2;
+            while (i < line.len and !(line[i] >= 0x40 and line[i] <= 0x7e)) : (i += 1) {}
+            if (i < line.len) i += 1;
+        } else {
+            if (line[i] >= 0x20) {
+                out[w] = line[i];
+                w += 1;
+            }
+            i += 1;
         }
     }
-
-    var long_buf: [512]u8 = undefined;
-    var long_stats = stats;
-    long_stats.accepted = std.math.maxInt(i64);
-    long_stats.blocks = std.math.maxInt(i64);
-    long_stats.rejected = std.math.maxInt(i64);
-    const long_line = formatStatusLine(&long_buf, long_stats, true, 56);
-    try std.testing.expect(visibleWidth(long_line) <= 55);
-    try std.testing.expect(std.mem.indexOf(u8, long_line, "M:") == null);
-    try std.testing.expect(std.mem.indexOf(u8, long_line, "H:7212998") != null);
-
-    var verbose_buf: [512]u8 = undefined;
-    var verbose_stats = stats;
-    verbose_stats.verbose = true;
-    const verbose_line = formatStatusLine(&verbose_buf, verbose_stats, true, 80);
-    try std.testing.expect(visibleWidth(verbose_line) <= 79);
-    try std.testing.expect(std.mem.indexOf(u8, verbose_line, "funnel") == null);
+    return out[0..w];
 }
 
-test "formatStatusLine appends verbose counters to the same row" {
-    var buf: [512]u8 = undefined;
-    const line = formatStatusLine(&buf, .{
-        .rate = 1.0,
-        .avg = 2.0,
-        .height = 3,
-        .accepted = 4,
-        .blocks = 5,
-        .rejected = 6,
-        .diff = "7K",
-        .hh = 8,
-        .mm = 9,
-        .ss = 10,
-        .verbose = true,
-        .submitted = 11,
-        .stale_drops = 12,
-        .submit_drops = 13,
-    }, true, 200);
+fn countSgr(line: []const u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i + 1 < line.len) : (i += 1) {
+        if (line[i] == '\x1b' and line[i + 1] == '[') n += 1;
+    }
+    return n;
+}
 
-    try std.testing.expect(std.mem.indexOf(u8, line, " | funnel submitted:11 acc:4 rej:6 stale:12 sendfail:13") != null);
-    try std.testing.expect(std.mem.indexOfScalar(u8, line, '\n') == null);
-    try std.testing.expect(std.mem.endsWith(u8, line, A_RESET ++ A_CLREOL));
+test "each rung renders the family's canonical payload at its own width" {
+    // palette_sgr is the family's documented per-tier count: 16/16/14/12/6.
+    const cases = [_]struct { layout: StatusLayout, want: []const u8, cols: usize, palette_sgr: usize }{
+        .{ .layout = .full, .want = fx_full, .cols = 115, .palette_sgr = 16 },
+        .{ .layout = .medium, .want = fx_medium, .cols = 87, .palette_sgr = 16 },
+        .{ .layout = .narrow, .want = fx_narrow, .cols = 76, .palette_sgr = 14 },
+        .{ .layout = .compact, .want = fx_compact, .cols = 54, .palette_sgr = 12 },
+        .{ .layout = .minimal, .want = fx_minimal, .cols = 26, .palette_sgr = 6 },
+    };
+    for (cases) |c| {
+        var buf: [1024]u8 = undefined;
+        const line = try renderStatusLayout(&buf, fixture, c.layout);
+        var plain: [1024]u8 = undefined;
+        try std.testing.expectEqualStrings(c.want, stripAnsi(&plain, line));
+        try std.testing.expectEqual(c.cols, visibleWidth(line));
+        // +2 for the trailing reset and erase, which every tier carries. A FULL
+        // of 19 here means the legacy trailing A_BWHITE has come back.
+        try std.testing.expectEqual(c.palette_sgr + 2, countSgr(line));
+    }
+}
+
+test "FULL ends with the time colour straight into reset -- no extra escape" {
+    // The single highest-risk byte in the family spec. An A_BWHITE here is a
+    // visual no-op (a colour set immediately before a reset), so nothing but a
+    // byte assertion will ever catch its return. C++ and Rust emit 16 SGR at
+    // FULL; this file used to emit 17, and Go inherited that from here.
+    var buf: [1024]u8 = undefined;
+    const line = try renderStatusLayout(&buf, fixture, .full);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        line,
+        A_WHITE ++ "00:01:11" ++ A_RESET ++ A_CLREOL,
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, line, A_BWHITE ++ A_RESET) == null);
+}
+
+test "canonical FULL coloured bytes" {
+    var buf: [1024]u8 = undefined;
+    const line = try renderStatusLayout(&buf, fixture, .full);
+    try std.testing.expectEqualStrings(
+        "\r" ++ A_BYELLOW ++ "[DIRTYBIRD] " ++ A_BGREEN ++ "0.00 KH/s" ++ A_BWHITE ++ " (" ++
+            A_GREEN ++ "4.96 KH/s avg" ++ A_BWHITE ++ ") | " ++ A_BLUE ++ "Height:7368356" ++ A_BWHITE ++ " | " ++
+            A_CYAN ++ "Miniblocks:962" ++ A_BWHITE ++ " | " ++ A_GREEN ++ "Blocks:93" ++ A_BWHITE ++ " | " ++
+            A_BRED ++ "REJ:25" ++ A_BWHITE ++ " | " ++ A_MAGENTA ++ "Diff:795K" ++ A_BWHITE ++ " | " ++
+            A_WHITE ++ "00:01:11" ++ A_RESET ++ A_CLREOL,
+        line,
+    );
+}
+
+test "MEDIUM coloured bytes with a non-zero reject count" {
+    // The rejects-are-red escape is pinned almost nowhere in the family: every
+    // other coloured golden uses R:0, where RejHi and Time are the same bytes.
+    var buf: [1024]u8 = undefined;
+    const line = try renderStatusLayout(&buf, fixture, .medium);
+    try std.testing.expectEqualStrings(
+        "\r" ++ A_BYELLOW ++ "[DIRTYBIRD] " ++ A_BGREEN ++ "0.00 KH/s" ++ A_BWHITE ++ " (" ++
+            A_GREEN ++ "4.96 avg" ++ A_BWHITE ++ ") | " ++ A_BLUE ++ "H:7368356" ++ A_BWHITE ++ " | " ++
+            A_CYAN ++ "MB:962" ++ A_BWHITE ++ " | " ++ A_GREEN ++ "B:93" ++ A_BWHITE ++ " | " ++
+            A_BRED ++ "R:25" ++ A_BWHITE ++ " | " ++ A_MAGENTA ++ "D:795K" ++ A_BWHITE ++ " | " ++
+            A_WHITE ++ "00:01:11" ++ A_RESET ++ A_CLREOL,
+        line,
+    );
+
+    // ...and the reject colour is the ONLY value-dependent escape.
+    var zero = fixture;
+    zero.rejected = 0;
+    var zbuf: [1024]u8 = undefined;
+    const zline = try renderStatusLayout(&zbuf, zero, .medium);
+    try std.testing.expect(std.mem.indexOf(u8, zline, A_BRED) == null);
+    try std.testing.expect(std.mem.indexOf(u8, zline, A_WHITE ++ "R:0") != null);
+}
+
+test "the width ladder selects the expected rung at every boundary" {
+    const Row = struct { cols: usize, want: []const u8 };
+    const table = [_]Row{
+        .{ .cols = 0, .want = fx_full }, // unknown width => unbounded
+        .{ .cols = 200, .want = fx_full },
+        .{ .cols = 116, .want = fx_full }, // boundary
+        .{ .cols = 115, .want = fx_medium }, // boundary - 1
+        .{ .cols = 88, .want = fx_medium }, // boundary
+        .{ .cols = 87, .want = fx_narrow }, // boundary - 1
+        .{ .cols = 80, .want = fx_narrow }, // classic console
+        .{ .cols = 77, .want = fx_narrow }, // boundary
+        .{ .cols = 76, .want = fx_compact }, // boundary - 1
+        .{ .cols = 56, .want = fx_compact }, // the reported Termux width
+        .{ .cols = 55, .want = fx_compact }, // boundary
+        .{ .cols = 54, .want = fx_minimal }, // boundary - 1
+        .{ .cols = 27, .want = fx_minimal }, // boundary
+    };
+    for (table) |row| {
+        var buf: [2048]u8 = undefined;
+        const line = formatStatusLine(&buf, fixture, true, row.cols);
+        var plain: [2048]u8 = undefined;
+        try std.testing.expectEqualStrings(row.want, stripAnsi(&plain, line));
+
+        // Structural invariants, every row.
+        try std.testing.expect(line[0] == '\r');
+        try std.testing.expect(std.mem.indexOfScalar(u8, line[1..], '\r') == null);
+        try std.testing.expect(std.mem.indexOfScalar(u8, line, '\n') == null);
+        try std.testing.expect(std.mem.endsWith(u8, line, A_RESET ++ A_CLREOL));
+        if (row.cols > 0) try std.testing.expect(visibleWidth(line) <= row.cols - 1);
+    }
+}
+
+test "below the smallest rung the line is clamped, never mangled" {
+    const table = [_]struct { cols: usize, want: []const u8 }{
+        .{ .cols = 26, .want = "[DB] 0.00 KH/s MB:962 B:9" },
+        .{ .cols = 20, .want = "[DB] 0.00 KH/s MB:9" },
+        .{ .cols = 10, .want = "[DB] 0.00" },
+        .{ .cols = 1, .want = "" },
+    };
+    for (table) |row| {
+        var buf: [2048]u8 = undefined;
+        const line = formatStatusLine(&buf, fixture, true, row.cols);
+        var plain: [2048]u8 = undefined;
+        try std.testing.expectEqualStrings(row.want, stripAnsi(&plain, line));
+        try std.testing.expect(visibleWidth(line) <= row.cols - 1);
+        // Colour state must still be reset and the row cleared, or a heavily
+        // clamped line leaves the previous tick's tail on screen under a
+        // half-written escape.
+        try std.testing.expect(std.mem.endsWith(u8, line, A_RESET ++ A_CLREOL));
+        try std.testing.expect(line[0] == '\r');
+    }
+}
+
+test "colour never changes which rung is selected" {
+    // A byte-length comparison instead of a column count would pin every
+    // terminal to the narrowest rung. Verify the plain payload is width-driven
+    // only: the visible text at width N must equal the visible text of the rung
+    // the ladder picks, regardless of how many escape bytes it carries.
+    var cols: usize = 20;
+    while (cols <= 130) : (cols += 1) {
+        var buf: [2048]u8 = undefined;
+        const line = formatStatusLine(&buf, fixture, true, cols);
+        try std.testing.expect(visibleWidth(line) <= cols - 1);
+        var plain: [2048]u8 = undefined;
+        const p = stripAnsi(&plain, line);
+        const known = std.mem.eql(u8, p, fx_full) or std.mem.eql(u8, p, fx_medium) or
+            std.mem.eql(u8, p, fx_narrow) or std.mem.eql(u8, p, fx_compact) or
+            std.mem.eql(u8, p, fx_minimal) or
+            (p.len < fx_minimal.len and std.mem.startsWith(u8, fx_minimal, p));
+        try std.testing.expect(known);
+    }
+}
+
+test "difficulty humanisation truncates and never rounds" {
+    // Shared vector table. This is untested in all four miners: every status
+    // fixture passes `diff` pre-formatted, and the C++ reference does not
+    // humanise at all (its DlunaStatus.diff is a const char *). So the reference
+    // suite provides zero coverage here and two ports can agree on every status
+    // width while disagreeing in production. 1999 -> "1K": a %.1f or rounding
+    // port emits "2K".
+    const cases = [_]struct { in: u64, want: []const u8 }{
+        .{ .in = 0, .want = "0" },
+        .{ .in = 999, .want = "999" },
+        .{ .in = 1_000, .want = "1K" },
+        .{ .in = 1_999, .want = "1K" },
+        .{ .in = 795_000, .want = "795K" },
+        .{ .in = 999_999, .want = "999K" },
+        .{ .in = 1_000_000, .want = "1M" },
+        .{ .in = 999_999_999, .want = "999M" },
+        .{ .in = 1_000_000_000, .want = "1G" },
+        .{ .in = std.math.maxInt(u64), .want = "18446744073G" },
+    };
+    for (cases) |c| {
+        var buf: [24]u8 = undefined;
+        try std.testing.expectEqualStrings(c.want, fmtDiff(&buf, c.in));
+    }
+}
+
+test "a 100-hour uptime widens every rung carrying it" {
+    // %02d does not clamp: hh=100 renders "100:00:00", 9 columns not 8. No
+    // fixture in any of the four miners crosses this, so every published tier
+    // width silently shifts on a rig that runs four days.
+    var long = fixture;
+    long.hh = 100;
+    var buf: [2048]u8 = undefined;
+    const line = try renderStatusLayout(&buf, long, .full);
+    try std.testing.expectEqual(@as(usize, 116), visibleWidth(line));
+    var plain: [2048]u8 = undefined;
+    try std.testing.expect(std.mem.endsWith(u8, stripAnsi(&plain, line), "| 100:01:11"));
 }
 
 test "formatStatusLine emits one plain newline record when redirected" {
