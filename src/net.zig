@@ -37,6 +37,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const dns = @import("dns.zig");
 const tls = std.crypto.tls;
 const is_windows = builtin.os.tag == .windows;
 
@@ -547,23 +548,39 @@ fn connectAndUpgrade(
     hooks.log(hooks.ctx, "INFO", std.fmt.bufPrint(&logbuf, "Connecting ({s}:{d})", .{ cfg.host, cfg.port }) catch "Connecting");
 
     // ---- DNS resolve (IPv4 only) ----
-    const list = try std.net.getAddressList(allocator, cfg.host, cfg.port);
-    defer list.deinit();
-    var addr: ?std.net.Address = null;
-    for (list.addrs) |a| {
-        if (a.any.family == std.posix.AF.INET) {
-            addr = a;
-            break;
+    // The system resolver answers everywhere except Android, which has no
+    // /etc/resolv.conf: std then queries 127.0.0.1:53, nothing is listening,
+    // and every pool hostname fails under Termux. Fall back to public
+    // resolvers over UDP in that case (src/dns.zig).
+    var target: ?std.net.Address = null;
+    if (std.net.getAddressList(allocator, cfg.host, cfg.port)) |list| {
+        defer list.deinit();
+        for (list.addrs) |a| {
+            if (a.any.family == std.posix.AF.INET) {
+                target = a;
+                break;
+            }
+        }
+    } else |_| {}
+
+    if (target == null) {
+        target = dns.resolveIPv4(cfg.host, cfg.port) catch null;
+        if (target != null) {
+            hooks.log(hooks.ctx, "INFO", std.fmt.bufPrint(
+                &logbuf,
+                "Resolved {s} via public DNS (no system resolver)",
+                .{cfg.host},
+            ) catch "Resolved via public DNS");
         }
     }
-    const target = addr orelse return error.NoIPv4Address;
+    const resolved = target orelse return error.NoIPv4Address;
 
     // ---- TCP connect ----
     // Windows: keep std.net.tcpConnectToAddress (it handles WSAStartup internally).
     // POSIX: socket(AF.INET, SOCK.STREAM) + connect to the resolved IPv4, then wrap
     // the fd in a std.net.Stream so Conn/close()/stream()/setTcpNoDelay are unchanged.
     const netstream = if (is_windows)
-        try std.net.tcpConnectToAddress(target)
+        try std.net.tcpConnectToAddress(resolved)
     else blk: {
         const fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
         errdefer std.posix.close(fd); // free the fd if connect fails (Conn isn't built yet)
@@ -574,7 +591,7 @@ fn connectAndUpgrade(
             .mask = std.posix.empty_sigset,
             .flags = 0,
         }, null);
-        try std.posix.connect(fd, &target.any, target.getOsSockLen());
+        try std.posix.connect(fd, &resolved.any, resolved.getOsSockLen());
         break :blk std.net.Stream{ .handle = fd };
     };
     var conn = Conn{ .netstream = netstream, .client = null, .timeout_ms = CONNECT_TIMEOUT_MS };

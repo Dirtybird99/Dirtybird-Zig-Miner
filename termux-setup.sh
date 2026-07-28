@@ -137,6 +137,30 @@ trap 'rm -rf "$TMP"' EXIT
 info "Downloading $ASSET ..."
 fetch_to "$URL" "$TMP/$ASSET" || die "download failed: $URL"
 
+# ---- 4a. verify the download before anything executes it --------------------
+# Every release publishes SHA256SUMS.txt; not checking it meant gzip's CRC was
+# the only thing standing between a truncated or corrupted transfer and a
+# binary that then runs unattended for days. Same-origin, so this is integrity
+# rather than compromise resistance -- but it is the check the release already
+# ships the data for.
+if have sha256sum; then
+  info "Verifying checksum..."
+  SUMS_URL="https://github.com/$REPO/releases/download/$TAG/SHA256SUMS.txt"
+  if fetch "$SUMS_URL" > "$TMP/SHA256SUMS.txt" 2>/dev/null && [ -s "$TMP/SHA256SUMS.txt" ]; then
+    # Match the asset name exactly: a substring grep would also accept a line
+    # for a different artifact that happens to contain this name.
+    EXPECTED="$(awk -v f="$ASSET" '$2 == f || $2 == "*" f {print; exit}' "$TMP/SHA256SUMS.txt")"
+    [ -n "$EXPECTED" ] || die "SHA256SUMS.txt has no entry for $ASSET"
+    ( cd "$TMP" && printf '%s\n' "$EXPECTED" | sha256sum -c - >/dev/null 2>&1 ) \
+      || die "checksum mismatch for $ASSET -- corrupt or tampered download; not installing"
+    info "Checksum OK."
+  else
+    warn "could not fetch SHA256SUMS.txt; skipping integrity check"
+  fi
+else
+  warn "sha256sum not available; skipping integrity check"
+fi
+
 info "Extracting..."
 tar -xzf "$TMP/$ASSET" -C "$TMP" || die "extract failed (corrupt download?)"
 
@@ -211,8 +235,41 @@ printf '{\n  "daemon-address": "%s",\n  "wallet": "%s",\n  "threads": %s\n}\n' \
   "$ADDR_JSON" "$WALLET_JSON" "$THREADS" > config.json
 info "Wrote $INSTALL_DIR/config.json (threads: $THREADS, daemon: $ADDR)"
 
-# ---- 8. mine -----------------------------------------------------------------
+# ---- 8. wake-lock ------------------------------------------------------------
+# Without one, Android Doze suspends the process as soon as the screen sleeps:
+# the miner quietly stops earning and nothing tells the user it happened.
+WAKE_LOCKED=0
+release_wake_lock() {
+  if [ "$WAKE_LOCKED" -eq 1 ]; then
+    WAKE_LOCKED=0
+    termux-wake-unlock >/dev/null 2>&1 || true
+    info "Wake-lock released."
+  fi
+}
+# Registered before acquiring, so a Ctrl-C landing in between still cleans up.
+# INT/TERM/HUP must EXIT rather than return -- a returning trap would resume the
+# script -- and HUP matters because closing the Termux session sends it, and an
+# untrapped fatal signal skips the EXIT trap entirely, leaking the lock.
+trap 'rm -rf "$TMP"; release_wake_lock' EXIT
+trap 'release_wake_lock; exit 130' INT TERM HUP
+
+if have termux-wake-lock; then
+  # timeout: the termux-api shim blocks forever when its companion app is not
+  # installed, and `have` only proves the shim exists.
+  if timeout 5 termux-wake-lock >/dev/null 2>&1; then
+    WAKE_LOCKED=1
+    info "Wake-lock acquired (Android Doze will not suspend the miner)."
+  else
+    warn "could not acquire a wake-lock -- Android Doze may pause the miner in the background."
+  fi
+else
+  warn "termux-api not installed -- Android Doze may pause the miner in the background."
+  warn "enable wake-locks with: pkg install termux-api"
+fi
+
+# ---- 9. mine -----------------------------------------------------------------
 printf '\n'
 info "Starting miner... (Ctrl-C to stop)"
 printf '\n'
-exec ./zig-miner
+# Not `exec`: the shell has to outlive the miner to release the wake-lock.
+./zig-miner
