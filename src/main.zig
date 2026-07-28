@@ -202,10 +202,6 @@ const ReportStats = struct {
     hh: u64,
     mm: u64,
     ss: u64,
-    verbose: bool = false,
-    submitted: i64 = 0,
-    stale_drops: i64 = 0,
-    submit_drops: i64 = 0,
 };
 
 const rate_window_slots = 10;
@@ -481,6 +477,9 @@ fn reporter() void {
         const accepted = G.accepted.load(.monotonic);
         const blocks = G.blocks.load(.monotonic);
         const rejected = G.rejected.load(.monotonic);
+        const submitted = G.submitted.load(.monotonic);
+        const stale_drops = G.stale_drops.load(.monotonic);
+        const submit_drops = G.submit_drops.load(.monotonic);
         var dbuf: [24]u8 = undefined;
         const diff = fmtDiff(&dbuf, G.difficulty.load(.monotonic));
 
@@ -499,10 +498,6 @@ fn reporter() void {
             .hh = hh,
             .mm = mm,
             .ss = ss,
-            .verbose = g_verbose,
-            .submitted = G.submitted.load(.monotonic),
-            .stale_drops = G.stale_drops.load(.monotonic),
-            .submit_drops = G.submit_drops.load(.monotonic),
         }, g_status_tty, if (g_status_tty) terminalColumns() else 0);
         std.debug.print("{s}", .{line});
 
@@ -511,10 +506,15 @@ fn reporter() void {
         // FULL past its width and silently select a narrower rung than the
         // terminal could actually hold -- and it landed after the reset, so the
         // line no longer ended with one. C++ and Rust both keep it outside.
+        //
+        // All five counters come from the one snapshot taken above. They used to
+        // be split -- acc/rej from locals, the other three loaded fresh at the
+        // call -- so the record could pair a `submitted` from after a tick with
+        // an `acc`/`rej` from before it, and the funnel would not balance. That
+        // arithmetic balancing is the only reason this record exists.
         if (g_verbose) {
             console.logLine("INFO", "funnel submitted:{d} acc:{d} rej:{d} stale:{d} sendfail:{d}", .{
-                G.submitted.load(.monotonic),   accepted,                        rejected,
-                G.stale_drops.load(.monotonic), G.submit_drops.load(.monotonic),
+                submitted, accepted, rejected, stale_drops, submit_drops,
             });
         }
     }
@@ -744,6 +744,12 @@ test "below the smallest rung the line is clamped, never mangled" {
     const table = [_]struct { cols: usize, want: []const u8 }{
         .{ .cols = 26, .want = "[DB] 0.00 KH/s MB:962 B:9" },
         .{ .cols = 20, .want = "[DB] 0.00 KH/s MB:9" },
+        // budget 10 -- the same budget as Go's own clamp golden, which is
+        // "[DB] 5.04 " for its fixture (status_test.go, `tiny`). Trailing space
+        // included: the clamp counts columns, it does not trim. This row is the
+        // only cross-miner check on the clamp payloads; every other rung was
+        // verified field-for-field against Go's renderer.
+        .{ .cols = 11, .want = "[DB] 0.00 " },
         .{ .cols = 10, .want = "[DB] 0.00" },
         .{ .cols = 1, .want = "" },
     };
