@@ -36,6 +36,9 @@ const Ctx = struct {
 fn onJob(ctx_ptr: *anyopaque, job: *const net.Job) void {
     const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr));
     _ = ctx.s.setJob(&job.blob, job.jobid(), job.height, job.difficulty);
+    // This connection has now issued work, so staged shares can be sent. Until
+    // this point the miner is still hashing the previous session's job.
+    ctx.s.markSessionHasJob();
     // Latch: only overwrite a counter when the job actually carried it, so a pool that
     // omits these fields doesn't flicker the display to 0 (matches the C ref).
     if (job.miniblocks) |m| ctx.s.accepted.store(m, .monotonic);
@@ -56,6 +59,11 @@ fn pollShare(ctx_ptr: *anyopaque) ?net.Share {
 fn setConnected(ctx_ptr: *anyopaque, connected: bool) void {
     const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr));
     ctx.s.connected.store(connected, .monotonic);
+    // A session boundary in either direction invalidates everything staged:
+    // job_epoch is monotonic across reconnects, so a share held from the old
+    // connection still matches the current epoch and would be sent on the new
+    // one against a job that session never issued.
+    ctx.s.resetSubmitSession();
 }
 
 /// net.zig's log sink: route its INFO/WARN/ERROR lines (Connecting/Connected/...) through

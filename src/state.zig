@@ -27,6 +27,10 @@ pub const MinerState = struct {
     job_epoch: Atomic(u64) = Atomic(u64).init(0),
 
     connected: Atomic(bool) = Atomic(bool).init(false),
+    /// True only once the CURRENT connection has delivered a job. Gates the
+    /// submit drain: job_epoch is monotonic across reconnects and so cannot
+    /// distinguish sessions on its own.
+    session_has_job: Atomic(bool) = Atomic(bool).init(false),
     quit: Atomic(bool) = Atomic(bool).init(false),
 
     // ---- submit mailbox: small FIFO ring so concurrent hits are never dropped ----
@@ -124,12 +128,50 @@ pub const MinerState = struct {
         self.submit_ready.store(true, .release);
     }
 
+    /// Drop everything staged and re-arm the session gate. Called when a
+    /// connection is established.
+    ///
+    /// job_epoch is MONOTONIC across reconnects, so a share staged moments
+    /// before a drop still MATCHES the current epoch -- takeStagedShare's
+    /// per-item check cannot tell it apart from a fresh one, and it would be
+    /// sent on the new connection against a job that session never issued.
+    /// Measured against a test daemon before this existed: 4 such shares
+    /// reached a fresh session. The sibling miners had the same defect (Go 17,
+    /// C++ 66) and closed it the same way.
+    ///
+    /// Clearing alone is not sufficient -- see session_has_job.
+    pub fn resetSubmitSession(self: *MinerState) void {
+        self.session_has_job.store(false, .release);
+        self.submit_mutex.lock();
+        defer self.submit_mutex.unlock();
+        if (self.submit_count > 0) {
+            _ = self.stale_drops.fetchAdd(@intCast(self.submit_count), .monotonic);
+            self.submit_count = 0;
+            self.submit_head = 0;
+        }
+        self.submit_ready.store(false, .release);
+    }
+
+    /// Mark that the CURRENT connection has delivered a job. Until it has, the
+    /// miner is still hashing the previous session's work: those shares match
+    /// the monotonic epoch but belong to a job this connection never sent, so
+    /// nothing may be submitted. Clearing the ring at connect does not cover
+    /// this, because workers keep staging during the ~500ms before the new
+    /// session's first push (in C++ that residue was 55 of the original 66).
+    pub fn markSessionHasJob(self: *MinerState) void {
+        self.session_has_job.store(true, .release);
+    }
+
     pub const StagedShare = struct { jobid_len: usize, epoch: u64 };
 
     /// Network side: pop the next non-stale staged share into caller buffers. Skips and
     /// counts stale entries. Returns null when the ring holds no fresh share. Call in a
     /// loop to drain a backlog: `while (takeStagedShare(...)) |s| send(s)`.
     pub fn takeStagedShare(self: *MinerState, out_jobid: []u8, out_blob_hex: []u8) ?StagedShare {
+        // Nothing may leave until this connection has issued a job; anything
+        // staged before that belongs to the previous session (see
+        // markSessionHasJob).
+        if (!self.session_has_job.load(.acquire)) return null;
         if (!self.submit_ready.load(.acquire)) return null;
         self.submit_mutex.lock();
         defer self.submit_mutex.unlock();
@@ -162,6 +204,8 @@ test "setJob detects change and bumps epoch; stage/take roundtrip" {
     try std.testing.expect(!s.setJob(&blob, "job1", 100, 1000));
     try std.testing.expectEqual(@as(u64, 1), s.job_epoch.load(.monotonic));
 
+    // The drain only runs on a live session that has issued work; model that.
+    s.markSessionHasJob();
     var hex = [_]u8{'a'} ** (BLOB_LEN * 2);
     s.stageShare("job1", &hex, 1);
     var jbuf: [MAX_JOBID]u8 = undefined;
@@ -178,6 +222,10 @@ test "submit ring: FIFO order, none lost, ring-full and stale handling" {
     var blob = [_]u8{0} ** BLOB_LEN;
     blob[0] = 0xCD;
     try std.testing.expect(s.setJob(&blob, "j", 1, 1000)); // epoch 1
+    // The network thread only drains on a live session that has issued work;
+    // takeStagedShare refuses to emit anything before that (see
+    // markSessionHasJob), so model a connected session here.
+    s.markSessionHasJob();
     var jbuf: [MAX_JOBID]u8 = undefined;
     var hbuf: [BLOB_LEN * 2]u8 = undefined;
 
@@ -214,4 +262,44 @@ test "submit ring: FIFO order, none lost, ring-full and stale handling" {
     try std.testing.expect(s.setJob(&blob2, "j2", 2, 1000)); // epoch -> 2
     try std.testing.expect(s.takeStagedShare(&jbuf, &hbuf) == null);
     try std.testing.expect(s.stale_drops.load(.monotonic) >= 1);
+}
+
+test "a share staged on a dead session is never sent on the next one" {
+    // job_epoch is MONOTONIC across reconnects, so the per-item epoch check in
+    // takeStagedShare cannot tell a share from the previous connection apart
+    // from a fresh one -- it matches. Measured against a test daemon before
+    // this was fixed: 4 such shares reached a fresh session (Go saw 17, C++ 66).
+    var s = MinerState{};
+    var blob = [_]u8{0} ** BLOB_LEN;
+    blob[0] = 0xCD;
+    var jbuf: [MAX_JOBID]u8 = undefined;
+    var hbuf: [BLOB_LEN * 2]u8 = undefined;
+
+    // --- session 1: connected, job received, a share staged but not yet sent.
+    try std.testing.expect(s.setJob(&blob, "old-job", 1, 1000));
+    s.markSessionHasJob();
+    var hex = [_]u8{'X'} ** (BLOB_LEN * 2);
+    s.stageShare("old-job", &hex, s.job_epoch.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), s.submit_count);
+
+    // --- the connection drops and a new one comes up.
+    s.resetSubmitSession();
+    try std.testing.expectEqual(@as(usize, 0), s.submit_count);
+    try std.testing.expect(s.takeStagedShare(&jbuf, &hbuf) == null);
+    // The loss is counted, not silent.
+    try std.testing.expectEqual(@as(i64, 1), s.stale_drops.load(.monotonic));
+
+    // --- CRUCIAL: workers keep hashing the OLD job until the new session
+    // pushes one, and those shares still match the monotonic epoch. Clearing
+    // the ring alone does not stop them -- in C++ this residue was 55 of the
+    // original 66. Nothing may be sent until this session issues work.
+    s.stageShare("old-job", &hex, s.job_epoch.load(.monotonic));
+    try std.testing.expect(s.takeStagedShare(&jbuf, &hbuf) == null);
+
+    // --- once the new session delivers a job, normal service resumes.
+    try std.testing.expect(s.setJob(&blob, "new-job", 2, 1000));
+    s.markSessionHasJob();
+    s.stageShare("new-job", &hex, s.job_epoch.load(.monotonic));
+    const got = s.takeStagedShare(&jbuf, &hbuf) orelse return error.FreshShareWasNotSent;
+    try std.testing.expectEqualStrings("new-job", jbuf[0..got.jobid_len]);
 }
