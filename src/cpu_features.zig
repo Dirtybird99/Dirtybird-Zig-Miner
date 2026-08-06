@@ -48,6 +48,11 @@ pub const CpuReport = struct {
     /// aarch64: the ARMv8 crypto extension backing the final SHA-256.
     armv8_sha2: bool = false,
     build_sha_avx2: bool = buildHasShaAvx2(),
+    /// x86_64: whether this build carries the AVX-512 suffix-array kernels
+    /// (64-byte comparator + 16-wide materialize, comptime-gated in
+    /// sa_v114_pure.zig on avx512f+avx512bw). Mirrors that gate so the startup
+    /// log tells the truth about which SA path was compiled in.
+    build_avx512: bool = buildHasAvx512(),
 
     pub fn brandSlice(self: *const CpuReport) []const u8 {
         const b = self.brand.slice();
@@ -75,7 +80,10 @@ pub fn log(report: CpuReport) void {
         yesNo(report.avx512),
         yesNo(report.sha),
     });
-    console.logLine("INFO", "Fast path: SHA-NI+AVX2 build {s}; AVX512 mining path No", .{yesNo(report.build_sha_avx2)});
+    console.logLine("INFO", "Fast path: SHA-NI+AVX2 build {s}; AVX-512 SA build {s}", .{
+        yesNo(report.build_sha_avx2),
+        yesNo(report.build_avx512),
+    });
 }
 
 pub fn yesNo(v: bool) []const u8 {
@@ -197,6 +205,11 @@ inline fn writeRegBytes(dest: *[4]u8, value: u32) void {
 fn buildHasShaAvx2() bool {
     return builtin.cpu.arch == .x86_64 and
         std.Target.x86.featureSetHasAll(builtin.cpu.features, .{ .sha, .avx2 });
+}
+
+fn buildHasAvx512() bool {
+    return builtin.cpu.arch == .x86_64 and
+        std.Target.x86.featureSetHasAll(builtin.cpu.features, .{ .avx512f, .avx512bw });
 }
 
 test "brand string is trimmed and collapses interior nul bytes" {

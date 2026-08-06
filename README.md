@@ -71,6 +71,7 @@ Requirements:
 - **Zig 0.14.1** (pinned).
 - **Platforms:** Windows, Linux, and Android/macOS (the socket layer is cross-platform — Winsock on Windows, `std.posix` elsewhere). TLS is `std.crypto.tls`; no OpenSSL needed.
 - **CPU:** for the accelerated final hash, an **x86-64 CPU with SHA-NI + AVX2** (AMD Zen, Intel Alder Lake+). The SHA-NI inline asm is comptime-gated on `+sha`, so on any other CPU — including ARM64 (Android, ARM Linux) — it transparently falls back to portable `std.crypto` (correct, just without the SHA-NI speedup). The ~10% edge over the reference is x86-only.
+- **AVX-512 (Zen4+ / Intel Skylake-X+):** the suffix-array stage — most of each hash — ships 64-byte AVX-512 compare and 16-wide copy kernels (`src/sa_v114_pure.zig`), comptime-gated on `avx512f+avx512bw` and measured ~+6% hashrate on AMD Zen5 (Ryzen AI MAX+ 395). A bare `zig build` on an x86-64 host targets the **host CPU automatically**, so AVX-512 hosts get the fast kernels with no flags; pass `-Dcpu=x86_64_v3+sha` (or `-Dtarget=...`) for a portable baseline — exactly what `scripts/release.sh` ships.
 
 Cross-compile examples: `-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v3+sha`, `-Dtarget=x86_64-linux-musl -Dcpu=x86_64_v3+sha` (static), `-Dtarget=aarch64-linux-musl` (ARM64 static). Native `aarch64-linux-android` additionally needs the Android NDK for Bionic libc.
 
