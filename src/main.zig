@@ -110,7 +110,7 @@ fn usage() void {
         \\  -w  DERO wallet address            (default from config.json / built-in)
         \\  -t  mining threads                 (default: logical CPU count)
         \\  -c, --config-file <path>           config file (default: config.json)
-        \\  -p, --priority <n>                 process priority (accepted for compatibility; not yet applied)
+        \\  -p, --priority <n|max>             process priority (accepted for compatibility; not yet applied)
         \\  -V  verbose
         \\  --selftest  run pow("a") KAT and exit (0=PASS,1=FAIL)
         \\  --bench     run an AstroBWTv3 hashrate benchmark (~5s) and exit
@@ -1181,8 +1181,10 @@ pub fn main() !u8 {
         } else if (std.mem.eql(u8, a, "-t")) {
             i += 1;
             if (i >= args.len) return flagError("{s} requires a value", .{a});
-            nthreads = std.fmt.parseInt(usize, args[i], 10) catch
-                return flagError("-t: invalid thread count '{s}'", .{args[i]});
+            // Signed on purpose: "-1"/"0" mean auto-detect (README flag table).
+            const tv = std.fmt.parseInt(i64, args[i], 10) catch
+                return flagError("-t: invalid thread count '{s}' (number, -1/0 = auto)", .{args[i]});
+            nthreads = if (tv <= 0) 0 else @intCast(tv);
         } else if (std.mem.eql(u8, a, "-V") or std.mem.eql(u8, a, "--verbose")) {
             g_verbose = true;
         } else if (std.mem.eql(u8, a, "--selftest")) {
@@ -1192,10 +1194,11 @@ pub fn main() !u8 {
         } else if (std.mem.eql(u8, a, "--setup")) {
             do_setup = true;
         } else if (std.mem.eql(u8, a, "-p") or std.mem.eql(u8, a, "--priority")) {
-            i += 1; // accepted for CLI compatibility; not yet applied
-            if (i >= args.len) return flagError("{s} requires a value", .{a});
-            _ = std.fmt.parseInt(i64, args[i], 10) catch
-                return flagError("{s}: invalid priority '{s}'", .{ a, args[i] });
+            // Value-agnostic on purpose: the C miner's spelling is `-p max`, and
+            // this flag exists for that CLI compatibility (value not yet applied).
+            i += 1;
+            if (i >= args.len or args[i].len == 0 or args[i][0] == '-')
+                return flagError("{s} requires a value", .{a});
         } else if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
             usage();
             return 0;
@@ -1250,11 +1253,7 @@ pub fn main() !u8 {
     if (do_selftest) return selftest(alloc);
     if (do_bench) return bench(alloc);
 
-    if (G.wallet.len == 0) {
-        std.debug.print("error: -w <wallet> is required\n", .{});
-        usage();
-        return 1;
-    }
+    if (G.wallet.len == 0) return flagError("-w <wallet> is required", .{});
 
     if (nthreads == 0) nthreads = std.Thread.getCpuCount() catch 4;
     G.nthreads = nthreads;
