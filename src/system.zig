@@ -107,6 +107,37 @@ extern "kernel32" fn SetThreadInformation(
     ThreadInformationSize: DWORD,
 ) callconv(.winapi) BOOL;
 extern "kernel32" fn GetLastError() callconv(.winapi) DWORD;
+extern "kernel32" fn GetLogicalProcessorInformationEx(
+    RelationshipType: DWORD,
+    Buffer: ?*anyopaque,
+    ReturnedLength: *DWORD,
+) callconv(.winapi) BOOL;
+extern "kernel32" fn GetProcessAffinityMask(
+    hProcess: HANDLE,
+    lpProcessAffinityMask: *ULONG_PTR,
+    lpSystemAffinityMask: *ULONG_PTR,
+) callconv(.winapi) BOOL;
+
+// ── SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX ──────────────────────────────────
+// The record is variable-length (GroupMask is a trailing array), so the walk
+// advances by each record's own Size field and reads fields at fixed offsets
+// rather than through an extern struct.
+//
+//   SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX
+//     +0  Relationship : DWORD
+//     +4  Size         : DWORD
+//     +8  PROCESSOR_RELATIONSHIP
+//           +0  Flags           : BYTE   (LTP_PC_SMT = 1)
+//           +1  EfficiencyClass : BYTE   (higher = higher performance)
+//           +2  Reserved[20]    : BYTE
+//          +22  GroupCount      : WORD
+//          +24  GroupMask[]     : GROUP_AFFINITY { Mask: ULONG_PTR, Group: WORD, Reserved[3]: WORD }
+const RelationProcessorCore: DWORD = 0;
+const REC_HEADER = 8;
+const PR_EFFICIENCY = REC_HEADER + 1;
+const PR_GROUP_COUNT = REC_HEADER + 22;
+const PR_GROUP_MASK = REC_HEADER + 24;
+const GROUP_AFFINITY_SIZE = 16;
 
 // ── advapi32 declarations ─────────────────────────────────────────────────────
 extern "advapi32" fn OpenProcessToken(
@@ -314,40 +345,180 @@ pub const MAX_AFFINITY: usize = 128;
 ///   2. Remaining SMT siblings last: they share L1/L2 with the core's first
 ///      thread; worst cache locality for this workload.
 ///
-/// Windows: derived from a fixed layout (i7-13700HX: P-core even logicals
-/// 0..14, then E-cores 16..23, then P-core HT siblings 1..15) because the
-/// current build has no portable topology API.
+/// Windows: discovered from GetLogicalProcessorInformationEx
+/// (RelationProcessorCore), filtered to the process affinity mask, so SMT
+/// siblings are read from each core's GroupMask rather than assumed and
+/// EfficiencyClass puts P-cores ahead of E-cores.
 ///
 /// Linux: discovered from sysfs (/sys/devices/system/cpu/cpuN/topology/
 /// thread_siblings_list), filtered to the process's allowed set
-/// (sched_getaffinity), so it adapts to AMD Zen4/Zen5, Intel hybrid, and
-/// cgroup-restricted environments. Falls back to an SMT-pair assumption
-/// (evens first) if sysfs is unreadable.
+/// (sched_getaffinity).
+///
+/// Both adapt to AMD Zen4/Zen5, Intel hybrid, and restricted CPU sets, and both
+/// fall back to an SMT-pair assumption (evens first) if discovery fails.
+///
+/// The order is a property of the machine, not of `n`, so it is computed once
+/// and cached: this is called from every mining thread's entry point.
 ///
 /// Returns up to MAX_AFFINITY entries; entries beyond n are 0-filled.
 pub fn recommendedAffinityForThreads(n: usize) [MAX_AFFINITY]u7 {
     var result = [_]u7{0} ** MAX_AFFINITY;
     const count = @min(n, MAX_AFFINITY);
 
-    if (comptime builtin.os.tag == .windows) {
-        // Fixed i7-13700HX layout: 8 distinct P-core physicals, 8 E-cores, 8 HT siblings.
-        const order = [_]u7{
-            0, 2, 4, 6, 8, 10, 12, 14, // 8 distinct P-core physicals
-            16, 17, 18, 19, 20, 21, 22, 23, // 8 E-cores (no HT)
-            1, 3, 5, 7, 9, 11, 13, 15, // 8 P-core HT siblings
-        };
-        for (0..@min(count, order.len)) |i| result[i] = order[i];
-    } else if (comptime builtin.os.tag == .linux) {
-        linuxAffinityOrder(&result, count);
-    } else {
+    if (comptime builtin.os.tag != .windows and builtin.os.tag != .linux) {
         for (0..count) |i| result[i] = @intCast(i);
+        return result;
     }
+
+    affinity_once.call();
+    // More threads than usable cpus wraps around the order rather than leaving
+    // zeros behind: a 0 entry would pin every surplus thread to cpu 0. The
+    // floor in initAffinityOrder guarantees affinity_len >= 1.
+    for (0..count) |i| result[i] = affinity_order[i % affinity_len];
     return result;
 }
 
-/// Linux: fill `result` with `count` logical CPUs ordered one-per-physical-core
-/// first, SMT siblings last. Respects the process's allowed affinity mask.
-fn linuxAffinityOrder(result: *[MAX_AFFINITY]u7, count: usize) void {
+var affinity_order = [_]u7{0} ** MAX_AFFINITY;
+var affinity_len: usize = 0;
+var affinity_once = std.once(initAffinityOrder);
+
+fn initAffinityOrder() void {
+    if (comptime builtin.os.tag == .windows) {
+        affinity_len = windowsAffinityOrder(&affinity_order);
+    } else if (comptime builtin.os.tag == .linux) {
+        affinity_len = linuxAffinityOrder(&affinity_order);
+    }
+    // Never leave an all-zero map: that would pin every thread to cpu 0. Plain
+    // ascending is the safe floor -- pins to a cpu that is genuinely disallowed
+    // fail silently, leaving that thread unpinned rather than stacked on core 0.
+    if (affinity_len == 0) {
+        for (0..MAX_AFFINITY) |i| affinity_order[i] = @intCast(i);
+        affinity_len = MAX_AFFINITY;
+    }
+}
+
+/// Fallback when the topology API is unavailable: assume SMT pairs (2i, 2i+1)
+/// and take evens before odds, over whatever the process affinity mask allows.
+fn windowsSmtPairOrder(out: *[MAX_AFFINITY]u7) usize {
+    var pmask: ULONG_PTR = 0;
+    var smask: ULONG_PTR = 0;
+    if (GetProcessAffinityMask(GetCurrentProcess(), &pmask, &smask) == FALSE or pmask == 0) return 0;
+
+    var olen: usize = 0;
+    for ([2]usize{ 0, 1 }) |parity| {
+        for (0..@bitSizeOf(ULONG_PTR)) |cpu| {
+            if (cpu % 2 != parity) continue;
+            if (pmask & (@as(ULONG_PTR, 1) << @intCast(cpu)) == 0) continue;
+            out[olen] = @intCast(cpu);
+            olen += 1;
+        }
+    }
+    return olen;
+}
+
+/// Fill `out` with logical CPUs ordered one-per-physical-core first (cores with
+/// a higher EfficiencyClass first, so P-cores precede E-cores), SMT siblings
+/// last. Returns the number written, or 0 if the topology could not be read.
+fn windowsAffinityOrder(out: *[MAX_AFFINITY]u7) usize {
+    var buf: [16 * 1024]u8 align(@alignOf(usize)) = undefined;
+    var len: DWORD = @intCast(buf.len);
+    if (GetLogicalProcessorInformationEx(RelationProcessorCore, @ptrCast(&buf), &len) == FALSE)
+        return windowsSmtPairOrder(out);
+    if (len > buf.len) return windowsSmtPairOrder(out);
+
+    const Entry = struct { eff: u8, cpu: u7, core: u8, primary: bool };
+    var ent: [MAX_AFFINITY]Entry = undefined;
+    var nent: usize = 0;
+    var ncore: usize = 0;
+    var multi_group = false;
+
+    var off: usize = 0;
+    while (off + REC_HEADER <= len and nent < MAX_AFFINITY) {
+        const rec = buf[off..len];
+        const size = std.mem.readInt(u32, rec[4..8], .little);
+        if (size < REC_HEADER or size > rec.len) break;
+        off += size;
+        if (std.mem.readInt(u32, rec[0..4], .little) != RelationProcessorCore) continue;
+        if (size < PR_GROUP_MASK + GROUP_AFFINITY_SIZE) continue;
+
+        const eff = rec[PR_EFFICIENCY];
+        const groups = std.mem.readInt(u16, rec[PR_GROUP_COUNT..][0..2], .little);
+        var core_has_primary = false;
+
+        var g: usize = 0;
+        while (g < groups) : (g += 1) {
+            const goff = PR_GROUP_MASK + g * GROUP_AFFINITY_SIZE;
+            if (goff + GROUP_AFFINITY_SIZE > size) break;
+            const mask = std.mem.readInt(usize, rec[goff..][0..@sizeOf(usize)], .little);
+            const group = std.mem.readInt(u16, rec[goff + @sizeOf(usize) ..][0..2], .little);
+            if (group != 0) multi_group = true;
+
+            var bit: usize = 0;
+            while (bit < @bitSizeOf(usize)) : (bit += 1) {
+                if (mask & (@as(usize, 1) << @intCast(bit)) == 0) continue;
+                // A GROUP_AFFINITY addresses one group's 64 processors, but the
+                // rest of this module indexes a single flat space.
+                const logical = @as(usize, group) * @bitSizeOf(usize) + bit;
+                if (logical >= MAX_AFFINITY or nent >= MAX_AFFINITY) continue;
+                ent[nent] = .{
+                    .eff = eff,
+                    .cpu = @intCast(logical),
+                    .core = @intCast(@min(ncore, 255)),
+                    .primary = !core_has_primary,
+                };
+                core_has_primary = true;
+                nent += 1;
+            }
+        }
+        ncore += 1;
+    }
+    if (nent == 0) return 0;
+
+    // GetProcessAffinityMask covers the caller's group only, so it is meaningful
+    // just when every discovered cpu lives in group 0.
+    if (!multi_group) {
+        var pmask: ULONG_PTR = 0;
+        var smask: ULONG_PTR = 0;
+        if (GetProcessAffinityMask(GetCurrentProcess(), &pmask, &smask) != FALSE and pmask != 0) {
+            var w: usize = 0;
+            for (0..nent) |i| {
+                if (ent[i].cpu >= @bitSizeOf(ULONG_PTR)) continue;
+                if (pmask & (@as(ULONG_PTR, 1) << @intCast(ent[i].cpu)) == 0) continue;
+                ent[w] = ent[i];
+                w += 1;
+            }
+            nent = w;
+            if (nent == 0) return 0;
+        }
+    }
+
+    // Masking can remove a core's first sibling, so re-derive which survivor
+    // represents each core instead of trusting the flag set during the walk.
+    for (0..nent) |i| {
+        var lowest = true;
+        for (0..nent) |j| {
+            if (j != i and ent[j].core == ent[i].core and ent[j].cpu < ent[i].cpu) lowest = false;
+        }
+        ent[i].primary = lowest;
+    }
+
+    const byOrder = struct {
+        fn f(_: void, a: Entry, b: Entry) bool {
+            if (a.primary != b.primary) return a.primary;
+            if (a.eff != b.eff) return a.eff > b.eff;
+            return a.cpu < b.cpu;
+        }
+    }.f;
+    std.mem.sort(Entry, ent[0..nent], {}, byOrder);
+
+    for (0..nent) |i| out[i] = ent[i].cpu;
+    return nent;
+}
+
+/// Linux: fill `result` with logical CPUs ordered one-per-physical-core first,
+/// SMT siblings last. Respects the process's allowed affinity mask. Returns the
+/// number written, or 0 if no cpu could be established.
+fn linuxAffinityOrder(result: *[MAX_AFFINITY]u7) usize {
     var allowed: std.os.linux.cpu_set_t = @splat(0);
     _ = std.os.linux.sched_getaffinity(0, @sizeOf(std.os.linux.cpu_set_t), &allowed);
 
@@ -431,15 +602,10 @@ fn linuxAffinityOrder(result: *[MAX_AFFINITY]u7, count: usize) void {
         }
     }
 
-    const take = @min(count, olen);
-    for (0..take) |i| result[i] = out[i];
-    if (olen == 0) {
-        // sched_getaffinity failed (allowed came back all zeros) or every cpu was
-        // filtered out. Never return an all-zero map: that would pin every thread
-        // to cpu 0. Fall back to plain ascending cpus; pins to any cpu that is
-        // genuinely disallowed fail silently, leaving that thread unpinned.
-        for (0..@min(count, MAX_AFFINITY)) |i| result[i] = @intCast(i);
-    }
+    // olen == 0 means sched_getaffinity failed (allowed came back all zeros) or
+    // every cpu was filtered out; the caller supplies the ascending floor.
+    for (0..olen) |i| result[i] = out[i];
+    return olen;
 }
 
 // ── internal helpers ──────────────────────────────────────────────────────────
@@ -457,19 +623,13 @@ test "roundUp" {
 
 test "recommendedAffinityForThreads ordering" {
     const map = recommendedAffinityForThreads(10);
-    if (builtin.os.tag == .windows) {
-        // Fixed i7-13700HX layout: 8 distinct P-core physicals, then 2 E-cores.
-        try std.testing.expectEqual(@as(u7, 0), map[0]);
-        try std.testing.expectEqual(@as(u7, 2), map[1]);
-        try std.testing.expectEqual(@as(u7, 14), map[7]);
-        try std.testing.expectEqual(@as(u7, 16), map[8]);
-        try std.testing.expectEqual(@as(u7, 17), map[9]);
-    } else if (builtin.os.tag == .linux) {
-        // Topology-aware: the map must never contain a cpu twice (machine-
-        // independent property). Ascending order can't be asserted here because
-        // on machines with fewer physical cores than requested threads the
-        // SMT siblings legitimately follow physicals (e.g. 0,2,4,6,1,3,... on a
-        // 4-core box), which is not strictly ascending.
+    if (builtin.os.tag == .windows or builtin.os.tag == .linux) {
+        // Both paths discover the machine's real topology, so only machine-
+        // independent properties can be asserted. Ascending order is not one of
+        // them: on a box with fewer physical cores than requested threads the SMT
+        // siblings legitimately follow the physicals (e.g. 0,2,4,6,1,3,... on a
+        // 4-core box). What must always hold is that no cpu is handed out twice --
+        // two mining threads sharing one logical cpu is the failure that matters.
         try std.testing.expectEqual(@as(u7, 0), map[0]);
         var seen = [_]bool{false} ** MAX_AFFINITY;
         for (0..10) |i| {
