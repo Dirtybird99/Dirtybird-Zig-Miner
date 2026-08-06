@@ -202,6 +202,22 @@ pub fn build(b: *std.Build) void {
     const p95_step = b.step("p95", "Run the p95 per-hash tail-latency harness");
     p95_step.dependOn(&p95_run.step);
 
+    // ---- compile-time-instrumented stage profiler for the exact pure-Zig
+    // production hash2 path. Usage: zig build prof -- [pairs] [repeats] [pin]
+    const prof = b.addExecutable(.{
+        .name = "prof",
+        .root_source_file = b.path("src/prof.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (want_pie) prof.pie = true;
+    addArmSha(b, prof, target, optimize, want_pie);
+    b.installArtifact(prof);
+    const prof_run = b.addRunArtifact(prof);
+    if (b.args) |args| prof_run.addArgs(args);
+    const prof_step = b.step("prof", "Run the pure-Zig production hash2 stage profiler");
+    prof_step.dependOn(&prof_run.step);
+
     // ---- differential harness (`zig build difftest -- gen|check ...`): emit
     // deterministic inputs, or hash each and compare against `<in> <out>` pairs from a
     // reference (the C oracle, or a daemon harness). Wired so the fix for the
@@ -238,7 +254,7 @@ pub fn build(b: *std.Build) void {
     // Zig-LTO'd shared library so the Rust miner can link the SA exactly as this miner
     // builds it (clang-19 + PGO + -flto, whole-program-LTO'd by Zig's own lld). addSaDeps
     // gives it the identical C/C++ compilation; sa_dll.zig re-exports the entry points.
-    // This step is additive — a bare `zig build` still builds only the miner + bench.
+    // This step is additive — the DLL is the one artifact a bare `zig build` skips.
     const sa_dll = b.addSharedLibrary(.{
         .name = "dero_sa",
         .root_source_file = b.path("sa_dll.zig"),

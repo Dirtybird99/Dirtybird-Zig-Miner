@@ -10,6 +10,26 @@ const sa_fast = @import("sa_fast.zig");
 const sa_v114_pure = @import("sa_v114_pure.zig");
 const sha_mb = @import("sha256_mb.zig");
 
+// The profiler root opts in at compile time. Normal miner/bench roots do not
+// declare this flag, so every timer and counter below is dead-code eliminated.
+const profile_enabled = if (@hasDecl(@import("root"), "astrobwt_profile_enabled"))
+    @import("root").astrobwt_profile_enabled
+else
+    false;
+
+pub const ProfileCounters = struct {
+    prepare_ns: u64 = 0,
+    op_loop_ns: u64 = 0,
+    sa_ns: u64 = 0,
+    final_hash2_ns: u64 = 0,
+};
+
+pub var profile_counters: ProfileCounters = .{};
+
+pub fn resetProfile() void {
+    if (profile_enabled) profile_counters = .{};
+}
+
 pub const Worker = astrobwt.Worker;
 
 /// Stage-5 SA backend selector -- all PURE ZIG (no C/C++ toolchain).
@@ -27,6 +47,10 @@ const SA_BACKEND: SaBackend = .v114_pure;
 /// or batched via `sha256_mb` (multi-buffer) -- splitting it out lets several
 /// independent hashes share a latency-hiding multi-buffer SHA.
 pub fn computeSA(input: []const u8, w: *Worker) !void {
+    var profile_timer: std.time.Timer = if (profile_enabled)
+        (std.time.Timer.start() catch unreachable)
+    else
+        undefined;
     var scratch: [384]u8 = [_]u8{0} ** 384;
 
     // 1. SHA256(input) -> scratch[320..352]
@@ -44,10 +68,12 @@ pub fn computeSA(input: []const u8, w: *Worker) !void {
     w.prev_lhash = w.lhash;
     w.tries = 0;
     @memcpy(w.sData[0..256], scratch[0..256]);
+    if (profile_enabled) profile_counters.prepare_ns += profile_timer.lap();
 
     // 5. wolfCompute -> sData[0..data_len]
     astrobwt.wolfCompute(w);
     @memset(w.sData[w.data_len..][0..16], 0);
+    if (profile_enabled) profile_counters.op_loop_ns += profile_timer.lap();
 
     // 6. suffix array (stage 5) -- byte-identical to libsais (validated bit-for-bit
     // vs the C++ oracle over the fuzz corpus). Backend chosen for cache behavior
@@ -72,6 +98,7 @@ pub fn computeSA(input: []const u8, w: *Worker) !void {
             sa_fast.radixSortSA8(w.sa_radix.?, w.sData[0..w.data_len].ptr, w.sa[0..w.data_len].ptr, w.data_len);
         },
     }
+    if (profile_enabled) profile_counters.sa_ns += profile_timer.lap();
 }
 
 /// SA bytes (the message hashed in stage 7) for a worker after computeSA.
@@ -94,9 +121,14 @@ pub fn hash(input: []const u8, out: *[32]u8, w: *Worker) !void {
 pub fn hash2(in0: []const u8, in1: []const u8, out0: *[32]u8, out1: *[32]u8, w0: *Worker, w1: *Worker) !void {
     try computeSA(in0, w0);
     try computeSA(in1, w1);
+    var profile_timer: std.time.Timer = if (profile_enabled)
+        (std.time.Timer.start() catch unreachable)
+    else
+        undefined;
     // Batched 2-way multi-buffer SHA-NI: interleaves the two latency-bound rnds2
     // chains so the OoO engine overlaps them (~1.3x throughput on Raptor Cove).
     sha_mb.hash2(saBytes(w0), saBytes(w1), out0, out1);
+    if (profile_enabled) profile_counters.final_hash2_ns += profile_timer.read();
 }
 
 test "KAT: pow(\"a\")" {

@@ -183,10 +183,12 @@ const SuffixCtx = struct {
     }
 };
 
-// Diagnostic instrumentation. When false (default) all of it is dead-code
-// eliminated, so the hot path has no global writes / timer calls (required for
-// the multi-threaded miner). Flip to true + rebuild sa_v114_check to re-profile.
-pub const INSTRUMENT = false;
+// Diagnostic instrumentation. Only src/prof.zig declares the root flag; normal
+// miner/bench roots leave this false, so all global writes/timers disappear.
+pub const INSTRUMENT = if (@hasDecl(@import("root"), "astrobwt_profile_enabled"))
+    @import("root").astrobwt_profile_enabled
+else
+    false;
 pub var stat_runs: u32 = 0;
 pub var stat_multi_pos: u32 = 0; // positions in multi-run buckets (re-sorted)
 pub var stat_single_pos: u32 = 0; // positions copied directly (single-run buckets)

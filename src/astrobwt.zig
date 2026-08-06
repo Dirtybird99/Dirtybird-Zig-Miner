@@ -5,6 +5,7 @@
 //! Every byte/u64 operation that wraps in C uses Zig wrapping operators (+% -% *%);
 //! develop in ReleaseSafe so a missed wrap panics at the exact site.
 const std = @import("std");
+const builtin = @import("builtin");
 const CodeLUT = @import("codelut.zig").CodeLUT;
 const sa_fast = @import("sa_fast.zig");
 const sa_v114_pure = @import("sa_v114_pure.zig");
@@ -12,6 +13,61 @@ const Rc4 = @import("primitives/rc4.zig").Rc4;
 const xxhash64 = @import("primitives/xxhash64.zig");
 const fnv1a = @import("primitives/fnv1a.zig");
 const siphash = @import("primitives/siphash.zig");
+
+// Only src/prof.zig declares this root flag. Normal miner/bench roots compile
+// wolfCompute without the counters or timestamp reads below.
+const profile_root_flag = if (@hasDecl(@import("root"), "astrobwt_profile_enabled"))
+    @import("root").astrobwt_profile_enabled
+else
+    false;
+
+/// The cycle split below reads the x86 TSC directly and so exists on x86-64 only.
+/// pow.zig's nanosecond timers and sa_v114_pure's INSTRUMENT counters are portable
+/// and stay available wherever the root flag is set.
+pub const profile_cycles_supported = builtin.cpu.arch == .x86_64;
+const profile_enabled = profile_root_flag and profile_cycles_supported;
+
+/// `[byte-op dispatch + chunk copy, loop hashes, RC4, chunk[255] fold]` TSC ticks.
+/// A profiled pass fills exactly one bucket -- the one named by `profile_wolf_bucket`
+/// -- so a profiled iteration pays a single rdtsc pair instead of one per boundary.
+pub var profile_wolf_cycles = [4]u64{ 0, 0, 0, 0 };
+/// Whole-wolfCompute TSC span, accumulated on every profiled call.
+pub var profile_wolf_total: u64 = 0;
+/// Profiled loop iterations, so the caller can subtract the calibrated probe cost.
+pub var profile_wolf_iters: u64 = 0;
+pub var profile_wolf_collect = false;
+pub var profile_wolf_bucket: u2 = 0;
+
+pub fn resetWolfProfile() void {
+    if (profile_enabled) {
+        profile_wolf_cycles = [4]u64{ 0, 0, 0, 0 };
+        profile_wolf_total = 0;
+        profile_wolf_iters = 0;
+    }
+}
+
+inline fn profileRdtsc() u64 {
+    // Guarded independently of every caller: the asm below must never be reachable
+    // by semantic analysis on a non-x86-64 target.
+    if (comptime !profile_cycles_supported) return 0;
+    var lo: u32 = undefined;
+    var hi: u32 = undefined;
+    asm volatile ("rdtsc"
+        : [_] "={eax}" (lo),
+          [_] "={edx}" (hi),
+        :
+        : "memory"
+    );
+    return (@as(u64, hi) << 32) | lo;
+}
+
+/// One bare back-to-back rdtsc pair. Each profiled iteration carries exactly this
+/// much probe cost, so the caller can calibrate it and subtract it back out.
+pub fn profileRdtscPair() u64 {
+    const t0 = profileRdtsc();
+    const t1 = profileRdtsc();
+    return t1 -% t0;
+}
 
 pub const SCRATCH: usize = 72000 + 64; // MAX_LENGTH + 64
 comptime {
@@ -193,6 +249,15 @@ fn wolfPermuteAvx2(in: [*]const u8, out: [*]u8, op: u8, p1: u8, p2: u8) void {
 
 /// The 278-iteration branch-compute loop. Fills w.sData[0..w.data_len].
 pub fn wolfCompute(w: *Worker) void {
+    const profile_this_call = profile_enabled and profile_wolf_collect;
+    const profile_bucket: usize = if (profile_this_call) profile_wolf_bucket else 0;
+    const profile_wolf_start = if (profile_this_call) profileRdtsc() else 0;
+    // Only the selected bucket's two edges read the TSC, so a profiled iteration
+    // runs two rdtsc instructions no matter which bucket is being timed.
+    var profile_lo: u64 = 0;
+    var profile_hi: u64 = 0;
+    var profile_bucket_cycles: u64 = 0;
+    var profile_iters: u64 = 0;
     w.template_idx = 0;
     var chunk_count: u32 = 1; // C++ chunkCount is int (no u8 wrap); must match for markers
     var first_chunk: i32 = 0;
@@ -224,6 +289,8 @@ pub fn wolfCompute(w: *Worker) void {
 
         chunk_off = @as(usize, w.tries - 1) * 256;
         const chunk = w.sData[chunk_off..][0..256];
+        // Boundary 0 sits above the chunk copy so bucket 0 accounts for it.
+        if (profile_this_call and profile_bucket == 0) profile_lo = profileRdtsc();
         var prev_chunk: *[256]u8 = chunk;
         if (w.tries != 1) {
             prev_chunk = w.sData[(@as(usize, w.tries - 2) * 256)..][0..256];
@@ -270,6 +337,13 @@ pub fn wolfCompute(w: *Worker) void {
                 }
             }
         }
+        if (profile_this_call) {
+            if (profile_bucket == 0) {
+                profile_hi = profileRdtsc();
+            } else if (profile_bucket == 1) {
+                profile_lo = profileRdtsc();
+            }
+        }
 
         // after_op
         w.A = chunk[p1] -% chunk[p2];
@@ -284,6 +358,13 @@ pub fn wolfCompute(w: *Worker) void {
         if (w.A < 0x30) {
             w.prev_lhash = w.lhash +% w.prev_lhash;
             w.lhash = siphash.hash(@as(u64, w.tries), w.prev_lhash, chunk[0..p2]);
+        }
+        if (profile_this_call) {
+            if (profile_bucket == 1) {
+                profile_hi = profileRdtsc();
+            } else if (profile_bucket == 2) {
+                profile_lo = profileRdtsc();
+            }
         }
 
         if (w.A <= 0x40) {
@@ -301,8 +382,20 @@ pub fn wolfCompute(w: *Worker) void {
         } else {
             chunk_count += 1;
         }
+        if (profile_this_call) {
+            if (profile_bucket == 2) {
+                profile_hi = profileRdtsc();
+            } else if (profile_bucket == 3) {
+                profile_lo = profileRdtsc();
+            }
+        }
 
         chunk[255] = chunk[255] ^ chunk[p1] ^ chunk[p2];
+        if (profile_this_call and profile_bucket == 3) profile_hi = profileRdtsc();
+        if (profile_this_call) {
+            profile_bucket_cycles +%= profile_hi -% profile_lo;
+            profile_iters += 1;
+        }
 
         if (w.tries > 276 or (chunk[255] >= 0xf0 and w.tries > 260)) break;
     }
@@ -317,6 +410,13 @@ pub fn wolfCompute(w: *Worker) void {
     const last = w.sData[chunk_off..][0..256];
     const tail: u64 = (@as(u64, last[253]) << 8 | @as(u64, last[254])) & 0x3ff;
     w.data_len = @intCast((@as(i64, w.tries) - 4) * 256 + @as(i64, @intCast(tail)));
+    if (profile_this_call) {
+        // The unmeasured remainder is reported as its own row rather than folded
+        // into a bucket, so no row silently absorbs the accounting error.
+        profile_wolf_total +%= profileRdtsc() -% profile_wolf_start;
+        profile_wolf_cycles[profile_bucket] +%= profile_bucket_cycles;
+        profile_wolf_iters += profile_iters;
+    }
     // NB: do NOT strip trailing zero bytes here. The DERO daemon
     // (astrobwt/astrobwtv3/pow.go), TNN, and the dirtybird reference all build the
     // suffix array over exactly data_len bytes and hash data_len*4 SA bytes -- a
