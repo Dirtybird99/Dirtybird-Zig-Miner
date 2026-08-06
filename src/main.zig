@@ -115,6 +115,7 @@ fn usage() void {
         \\  --selftest  run pow("a") KAT and exit (0=PASS,1=FAIL)
         \\  --bench     run an AstroBWTv3 hashrate benchmark (~5s) and exit
         \\  --setup     interactively write config.json (pool/wallet/threads), then exit
+        \\  --argdiag   print launch diagnostics (argv/auxv/linker-exec detection) and exit
         \\  -h, --help / -v, --version
         \\
     , .{});
@@ -1115,6 +1116,12 @@ pub fn main() !u8 {
     const raw_args = try std.process.argsAlloc(alloc);
     // argsFree must get the ORIGINAL slice; `args` below may be a shifted view of it.
     defer std.process.argsFree(alloc, raw_args);
+
+    // --argdiag reports the RAW launch state; scan before normalization so it
+    // works even when the launcher polluted argv.
+    for (raw_args) |a| {
+        if (std.mem.eql(u8, a, "--argdiag")) return linker_exec.argDiag(VERSION, raw_args);
+    }
 
     // Android/Termux launches through the system linker leave the binary's own
     // path in argv ahead of the real flags; normalize before any parsing.

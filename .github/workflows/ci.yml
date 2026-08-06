@@ -97,6 +97,35 @@ jobs:
           grep -q 'pow(a): .* PASS' arm64-fallback.log
           grep -q 'hash2 parity: PASS' arm64-fallback.log
 
+      # Termux on Android 10+ actually launches binaries as
+      #   execve("/system/bin/linker64", [argv0, "/abs/path/zig-miner", args...])
+      # and bionic never rewrites the kernel argument block, so a static binary
+      # sees its own path at argv[1] (issue #18). Simulate both detection
+      # signals the argv shim keys on. The on-device run remains the
+      # authoritative Termux check; these pin the argv-shape handling.
+      - name: Termux linker-exec argv simulations
+        run: |
+          BIN=out-arm64/bin/zig-miner
+          # sim-A (hard gate): termux-exec env marker + injected argv[1].
+          TERMUX_EXEC__PROC_SELF_EXE="$PWD/$BIN" \
+            qemu-aarch64-static "$BIN" "$PWD/$BIN" --selftest 2>&1 | tee sim-a.log
+          grep -q 'pow(a): .* PASS' sim-a.log
+          # sim-B: no env marker; the binary runs under the name linker64, so
+          # /proc/self/exe (qemu-user reports the guest path) is the evidence.
+          cp "$BIN" linker64
+          qemu-aarch64-static ./linker64 "$PWD/$BIN" --selftest 2>&1 | tee sim-b.log
+          grep -q 'pow(a): .* PASS' sim-b.log
+          # --argdiag must run, report the auxv, and exit 0.
+          qemu-aarch64-static "$BIN" --argdiag 2>&1 | tee argdiag.log
+          grep -q 'AT_PHDR' argdiag.log
+          # negative: unknown arguments fail loudly, not with bare usage.
+          set +e
+          qemu-aarch64-static "$BIN" --definitely-bogus 2>bogus.log
+          rc=$?
+          set -e
+          [ "$rc" -eq 1 ] || { echo "ERROR: expected exit 1, got $rc"; cat bogus.log; exit 1; }
+          grep -q "unknown argument: '--definitely-bogus'" bogus.log
+
   hygiene:
     name: Repo Hygiene
     runs-on: ubuntu-latest

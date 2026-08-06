@@ -166,6 +166,95 @@ fn gatherEvidence(arg1: ?[]const u8) Evidence {
     }
 }
 
+// ---- --argdiag ----
+
+/// Provided by the linker on ELF targets. Under linker-exec the auxv describes
+/// the LINKER's image (AT_PHDR included), so this symbol is the only
+/// auxv-independent way to find our own ELF header. Referenced exclusively
+/// from Linux comptime branches; lazy analysis keeps other targets clean.
+extern const __ehdr_start: std.elf.Ehdr;
+
+fn ownPhdrs() []const std.elf.Phdr {
+    const ehdr = &__ehdr_start;
+    const addr = @intFromPtr(ehdr) + @as(usize, @intCast(ehdr.e_phoff));
+    return @as([*]const std.elf.Phdr, @ptrFromInt(addr))[0..ehdr.e_phnum];
+}
+
+fn reportTls(label: []const u8, phdrs: []const std.elf.Phdr) void {
+    if (phdrs.len == 0) {
+        std.debug.print("{s}: <unavailable>\n", .{label});
+        return;
+    }
+    for (phdrs) |*ph| {
+        if (ph.p_type == std.elf.PT_TLS) {
+            std.debug.print("{s}: align 0x{x}  filesz 0x{x}  memsz 0x{x}\n", .{ label, ph.p_align, ph.p_filesz, ph.p_memsz });
+            return;
+        }
+    }
+    std.debug.print("{s}: none\n", .{label});
+}
+
+/// --argdiag: print the raw launch state (argv, auxv, self-exe resolution,
+/// shift verdict) and return the process exit code (always 0). Takes the RAW
+/// argv -- the pre-normalization view is the evidence being reported.
+pub fn argDiag(version: []const u8, raw_args: []const [:0]u8) u8 {
+    const p = std.debug.print;
+    p("argdiag : zig-miner v{s} ({s}-{s})\n", .{ version, @tagName(builtin.cpu.arch), @tagName(builtin.os.tag) });
+    p("argc    : {d}\n", .{raw_args.len});
+    for (raw_args, 0..) |a, idx| p("argv[{d}] : {s}\n", .{ idx, a });
+
+    if (builtin.os.tag == .linux) {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.fs.selfExePath(&buf)) |sp| {
+            p("/proc/self/exe : {s}\n", .{sp});
+        } else |e| {
+            p("/proc/self/exe : <error: {s}>\n", .{@errorName(e)});
+        }
+        const execfn = std.os.linux.getauxval(std.elf.AT_EXECFN);
+        if (execfn != 0) {
+            p("AT_EXECFN      : {s}\n", .{std.mem.span(@as([*:0]const u8, @ptrFromInt(execfn)))});
+        } else {
+            p("AT_EXECFN      : <unset>\n", .{});
+        }
+        if (std.posix.getenv(real_exe_env)) |v| {
+            p(real_exe_env ++ " : {s}\n", .{v});
+        } else {
+            p(real_exe_env ++ " : <unset>\n", .{});
+        }
+
+        const at_base = std.os.linux.getauxval(std.elf.AT_BASE);
+        const at_phdr = std.os.linux.getauxval(std.elf.AT_PHDR);
+        const at_phnum = std.os.linux.getauxval(std.elf.AT_PHNUM);
+        const own = ownPhdrs();
+        p("AT_BASE        : 0x{x}\n", .{at_base});
+        p("AT_PHDR (auxv) : 0x{x}  AT_PHNUM: {d}\n", .{ at_phdr, at_phnum });
+        p("own phdrs      : 0x{x}  phnum: {d}  (__ehdr_start)\n", .{ @intFromPtr(own.ptr), own.len });
+        if (at_phdr == @intFromPtr(own.ptr)) {
+            p("auxv identity  : MATCH -- auxv describes this binary\n", .{});
+        } else {
+            p("auxv identity  : MISMATCH -- auxv describes another image (the loader)\n", .{});
+        }
+        const auxv_phdrs: []const std.elf.Phdr = if (at_phdr != 0 and at_phnum != 0)
+            @as([*]const std.elf.Phdr, @ptrFromInt(at_phdr))[0..at_phnum]
+        else
+            &.{};
+        reportTls("PT_TLS (auxv)  ", auxv_phdrs);
+        reportTls("PT_TLS (own)   ", own);
+    } else {
+        p("(linux launch diagnostics not applicable on {s})\n", .{@tagName(builtin.os.tag)});
+    }
+
+    const arg1: ?[]const u8 = if (raw_args.len >= 2) raw_args[1] else null;
+    const v = decide(raw_args.len, arg1, gatherEvidence(arg1));
+    p("verdict : {s} -- {s}\n", .{ if (v.shift) "SHIFT" else "NO SHIFT", v.reason });
+    if (v.shift) {
+        p("normalized argv :", .{});
+        for (raw_args[1..]) |a| p(" {s}", .{a});
+        p("\n", .{});
+    }
+    return 0;
+}
+
 // ---- tests ----
 
 const t = std.testing;

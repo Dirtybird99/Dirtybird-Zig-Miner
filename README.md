@@ -46,6 +46,8 @@ curl -fsSL https://raw.githubusercontent.com/Dirtybird99/Dirtybird-Zig-Miner/mai
 
 The arm64 binary is built **PIE** (`ET_DYN`) so Android's loader accepts it — older non-PIE builds failed with `error: "...zig-miner" has unexpected e_type: 2`. Run the miner from `$HOME` (or `$PREFIX`), not `/sdcard`, which is mounted `noexec`. The installer handles both automatically.
 
+v0.3.0 and earlier printed the usage text and exited under Termux on Android 10+: Termux launches binaries through the system linker (`system_linker_exec`), which leaves the binary's own path in `argv` ahead of the real flags, and the miner rejected it as an unknown argument. v0.3.1 detects the linker launch and normalizes `argv` — if a launch ever looks wrong, `./zig-miner --argdiag` prints the raw argv/auxv state the miner saw.
+
 The setup menu includes Community Pools, Rabid Mining, dero-node.net solo, the DERO Foundation solo/full-block node, and a custom endpoint. A pool is the phone-friendly choice because payouts arrive more steadily; solo/full-block mining can go much longer between rewards.
 
 ## Algorithm (AstroBWTv3)
