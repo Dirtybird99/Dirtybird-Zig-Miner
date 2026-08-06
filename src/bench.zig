@@ -28,11 +28,14 @@ const AFF_MAPS = [_][10]u6{
 };
 
 fn worker(ctx: *Ctx, tid: usize) void {
-    // Affinity / priority / large-page helpers are Windows-only; comptime-guard so
-    // the bench cross-compiles and runs (unpinned) on Linux/macOS too.
-    if (comptime builtin.os.tag == .windows) {
+    // Affinity / priority helpers exist on Windows and Linux; comptime-guard so
+    // the bench also cross-compiles and runs unpinned on macOS.
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .linux) {
         if (ctx.aff) {
-            const cpu: u6 = if (ctx.nthreads == 10) AFF_MAPS[ctx.affmode][tid] else system.recommendedAffinityForThreads(ctx.nthreads)[tid];
+            const cpu: u7 = if (ctx.nthreads == 10 and builtin.os.tag == .windows)
+                AFF_MAPS[ctx.affmode][tid]
+            else
+                system.recommendedAffinityForThreads(ctx.nthreads)[@min(tid, system.MAX_AFFINITY - 1)];
             system.pinThreadToLogical(cpu);
             system.setThreadHighPriority();
         }
@@ -83,10 +86,12 @@ pub fn main() !void {
     if (comptime builtin.os.tag == .windows) {
         if (aff or hp) {
             _ = system.enableLockMemoryPrivilege();
-            if (aff) {
-                system.setProcessHighPriority();
-                std.debug.print("[affinity ON mode={d}, HIGH priority class]\n", .{affmode});
-            }
+        }
+    }
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .linux) {
+        if (aff) {
+            system.setProcessHighPriority();
+            std.debug.print("[affinity ON mode={d}, HIGH priority]\n", .{affmode});
         }
     }
     if (hp and builtin.os.tag == .linux) std.debug.print("[huge-pages THP requested]\n", .{});

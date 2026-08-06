@@ -25,9 +25,12 @@ const AFF_MAPS = [_][10]u6{
 };
 
 fn worker(ctx: *Ctx, tid: usize) void {
-    if (comptime builtin.os.tag == .windows) {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .linux) {
         if (ctx.aff) {
-            const cpu: u6 = if (ctx.nthreads == 10) AFF_MAPS[ctx.affmode][tid] else system.recommendedAffinityForThreads(ctx.nthreads)[tid];
+            const cpu: u7 = if (ctx.nthreads == 10 and builtin.os.tag == .windows)
+                AFF_MAPS[ctx.affmode][tid]
+            else
+                system.recommendedAffinityForThreads(ctx.nthreads)[@min(tid, system.MAX_AFFINITY - 1)];
             system.pinThreadToLogical(cpu);
             system.setThreadHighPriority();
         }
@@ -99,9 +102,11 @@ pub fn main() !void {
     if (comptime builtin.os.tag == .windows) {
         if (aff or hp) {
             _ = system.enableLockMemoryPrivilege();
-            if (aff) system.setProcessHighPriority();
             if (hp) std.debug.print("[large-pages ON]\n", .{});
         }
+    }
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .linux) {
+        if (aff) system.setProcessHighPriority();
     }
     if (hp and builtin.os.tag == .linux) std.debug.print("[huge-pages THP requested]\n", .{});
     const threads = try a.alloc(std.Thread, nthreads);

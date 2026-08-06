@@ -1308,9 +1308,12 @@ pub fn main() !u8 {
     installSignalHandler();
 
     // Max-performance profile (matches the C miner's `-p max`): HIGH priority
-    // class + SeLockMemoryPrivilege; per-thread P-core pinning is done in mineThread.
+    // class + SeLockMemoryPrivilege (Windows) / best-effort nice (Linux);
+    // per-thread core pinning is done in mineThread.
     if (builtin.os.tag == .windows) {
         _ = system.enableLockMemoryPrivilege();
+        system.setProcessHighPriority();
+    } else if (builtin.os.tag == .linux) {
         system.setProcessHighPriority();
     }
 
