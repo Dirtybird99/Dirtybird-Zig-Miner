@@ -948,12 +948,10 @@ fn setDaemon(hp_in: []const u8) void {
     G.tls = explicit_tls orelse true; // DERO getwork is TLS; bare addresses connect over wss://
 }
 
-/// Absolute path to config.json next to the real executable, or null if unresolved.
-/// Resolution sees through Android's system_linker_exec (where /proc/self/exe names
-/// the system linker, not this binary); argv0 is the normalized argv[0] fallback.
-fn exeConfigPath(alloc: std.mem.Allocator, argv0: ?[]const u8) ?[]u8 {
-    const dir = linker_exec.realExeDirAlloc(alloc, argv0) orelse return null;
-    defer alloc.free(dir);
+/// Absolute path to config.json inside the real executable's directory (as
+/// resolved once in main() via linker_exec), or null if unresolved.
+fn exeConfigPath(alloc: std.mem.Allocator, exe_dir: ?[]const u8) ?[]u8 {
+    const dir = exe_dir orelse return null;
     return std.fs.path.join(alloc, &.{ dir, "config.json" }) catch null;
 }
 
@@ -1117,17 +1115,24 @@ pub fn main() !u8 {
     // argsFree must get the ORIGINAL slice; `args` below may be a shifted view of it.
     defer std.process.argsFree(alloc, raw_args);
 
-    // --argdiag reports the RAW launch state; scan before normalization so it
-    // works even when the launcher polluted argv.
-    for (raw_args) |a| {
+    // --argdiag must dispatch BEFORE normalization: on a launch where the
+    // shift wrongly didn't fire, the parse loop would reject the injected
+    // path at args[1] and never reach the one flag that diagnoses exactly
+    // that state. Skip index 0 -- argv[0] is a name, not a flag.
+    if (raw_args.len > 1) for (raw_args[1..]) |a| {
         if (std.mem.eql(u8, a, "--argdiag")) return linker_exec.argDiag(VERSION, raw_args);
-    }
+    };
 
     // Android/Termux launches through the system linker leave the binary's own
     // path in argv ahead of the real flags; normalize before any parsing.
     const norm = linker_exec.normalizeArgs(raw_args);
     const args = norm.args;
     if (norm.shifted) std.debug.print("launch : android linker-exec detected -- argv normalized\n", .{});
+
+    // One resolution of the real executable's directory serves both the
+    // config.json read below and --setup's write; the two must agree.
+    const exe_dir: ?[]u8 = linker_exec.realExeDirAlloc(alloc, &norm);
+    defer if (exe_dir) |d| alloc.free(d);
 
     var do_selftest = false;
     var do_bench = false;
@@ -1154,7 +1159,7 @@ pub fn main() !u8 {
         if (explicit_cfg) |p| {
             loaded = loadConfig(alloc, p, &nthreads, &cfg_daemon, &cfg_threads);
         } else {
-            if (exeConfigPath(alloc, if (args.len > 0) args[0] else null)) |ep| {
+            if (exeConfigPath(alloc, exe_dir)) |ep| {
                 defer alloc.free(ep);
                 loaded = loadConfig(alloc, ep, &nthreads, &cfg_daemon, &cfg_threads);
             }
@@ -1205,7 +1210,15 @@ pub fn main() !u8 {
         } else if (std.mem.eql(u8, a, "-v") or std.mem.eql(u8, a, "--version")) {
             std.debug.print("zig-miner v{s}\n", .{VERSION});
             return 0;
+        } else if (std.mem.eql(u8, a, "--argdiag")) {
+            // Normally handled by the pre-normalization scan above; this
+            // branch keeps the documented flag alive if that scan ever moves.
+            return linker_exec.argDiag(VERSION, raw_args);
         } else {
+            // A non-flag token here is the signature of an undetected
+            // loader-injected argv (the argv-shift declined); say why.
+            if (a.len > 0 and a[0] != '-')
+                std.debug.print("note: launch detection: {s} -- run 'zig-miner --argdiag' for details\n", .{norm.reason});
             return flagError("unknown argument: '{s}'", .{a});
         }
     }
@@ -1231,7 +1244,7 @@ pub fn main() !u8 {
         var wpath_owned: ?[]u8 = null;
         defer if (wpath_owned) |p| alloc.free(p);
         const wpath: []const u8 = if (explicit_cfg) |p| p else blk: {
-            wpath_owned = exeConfigPath(alloc, if (args.len > 0) args[0] else null);
+            wpath_owned = exeConfigPath(alloc, exe_dir);
             break :blk (wpath_owned orelse "config.json");
         };
         const f = (if (std.fs.path.isAbsolute(wpath))
