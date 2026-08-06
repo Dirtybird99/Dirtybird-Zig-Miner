@@ -35,8 +35,9 @@ pub fn mineThread(s: *MinerState, tid: usize, w0: *pow.Worker, w1: *pow.Worker) 
     // first, then SMT siblings) and raise thread priority -- AstroBWTv3 is
     // memory/cache-bound, so distinct physical cores beat HT siblings (measured
     // +12% over the default scheduler, and HT-sibling packing is ~25% worse).
-    // Windows: fixed i7-13700HX layout. Linux: topology discovered from sysfs,
-    // so AMD Zen4/Zen5 and Intel hybrid both get one-thread-per-core first.
+    // Topology is discovered per OS (Windows: GetLogicalProcessorInformationEx,
+    // Linux: sysfs), so AMD Zen4/Zen5 and Intel hybrid both get
+    // one-thread-per-core first.
     if (builtin.os.tag == .windows or builtin.os.tag == .linux) {
         const map = system.recommendedAffinityForThreads(s.nthreads);
         system.pinThreadToLogical(map[@min(tid, system.MAX_AFFINITY - 1)]);
