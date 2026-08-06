@@ -106,6 +106,7 @@ jobs:
       # synthesizes a matching AT_PHDR; unit tests cover it.) The on-device run
       # remains the authoritative Termux check.
       - name: Termux linker-exec argv simulations
+        shell: bash
         run: |
           BIN=out-arm64/bin/zig-miner
           # dev/ino tier: env marker absolute, argv[1] deliberately RELATIVE so
@@ -137,9 +138,10 @@ jobs:
           [ "$rc" -eq 1 ] || { echo "ERROR: decoy expected exit 1, got $rc"; cat decoy.log; exit 1; }
           grep -q 'args\[1\] is not this binary' decoy.log
           grep -q 'unknown argument:' decoy.log
-          # --argdiag must report the auxv on a plain launch and exit 0.
+          # --argdiag must report a real auxv value on a plain launch and exit
+          # 0 (pipefail via shell: bash makes the qemu status load-bearing).
           qemu-aarch64-static "$BIN" --argdiag 2>&1 | tee argdiag.log
-          grep -q 'AT_PHDR' argdiag.log
+          grep -qE 'AT_PHDR \(auxv\) : 0x[0-9a-f]+' argdiag.log
           # unknown arguments fail loudly, not with bare usage.
           set +e
           qemu-aarch64-static "$BIN" --definitely-bogus 2>bogus.log

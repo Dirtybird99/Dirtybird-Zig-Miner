@@ -129,6 +129,11 @@ fn flagError(comptime fmt: []const u8, fargs: anytype) u8 {
     return 1;
 }
 
+fn parsesAsInt(s: []const u8) bool {
+    _ = std.fmt.parseInt(i64, s, 10) catch return false;
+    return true;
+}
+
 /// Run the pow("a") known-answer test, writing the lowercase hex digest into `hex_out`.
 /// Returns true on the expected digest. Pure (no printing) so both the startup KAT (silent
 /// on success, like the C miner) and the `--selftest` command can share it.
@@ -1181,7 +1186,9 @@ pub fn main() !u8 {
             if (i >= args.len) return flagError("{s} requires a value", .{a});
         } else if (std.mem.eql(u8, a, "-w")) {
             i += 1;
-            if (i >= args.len) return flagError("{s} requires a value", .{a});
+            // Leading-dash guard: a swallowed flag here would MINE TO IT.
+            if (i >= args.len or args[i].len == 0 or args[i][0] == '-')
+                return flagError("{s} requires a value", .{a});
             G.wallet = args[i];
         } else if (std.mem.eql(u8, a, "-t")) {
             i += 1;
@@ -1201,8 +1208,11 @@ pub fn main() !u8 {
         } else if (std.mem.eql(u8, a, "-p") or std.mem.eql(u8, a, "--priority")) {
             // Value-agnostic on purpose: the C miner's spelling is `-p max`, and
             // this flag exists for that CLI compatibility (value not yet applied).
+            // A leading dash is accepted only when it reads as a number, so
+            // `-p -1` works but `-p -V` cannot swallow the next flag.
             i += 1;
-            if (i >= args.len or args[i].len == 0 or args[i][0] == '-')
+            if (i >= args.len or args[i].len == 0 or
+                (args[i][0] == '-' and !parsesAsInt(args[i])))
                 return flagError("{s} requires a value", .{a});
         } else if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
             usage();

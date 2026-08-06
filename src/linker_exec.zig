@@ -57,6 +57,9 @@ pub const Evidence = struct {
 
 pub const Verdict = struct {
     shift: bool,
+    /// True when args[1] was positively IDENTIFIED as this binary (dev/ino or
+    /// exact path match), as opposed to the loader-context heuristic tier.
+    verified: bool = false,
     /// Static description of why; surfaced by --argdiag and on parse failures.
     reason: []const u8,
 };
@@ -74,13 +77,13 @@ pub fn decide(arg1: ?[]const u8, ev: Evidence) Verdict {
 
     if (ev.env_real_exe) |env_path| {
         if (ev.arg1_same_file_as_env) |same| {
-            if (same) return .{ .shift = true, .reason = real_exe_env ++ " set; args[1] is this binary (dev/ino)" };
+            if (same) return .{ .shift = true, .verified = true, .reason = real_exe_env ++ " set; args[1] is this binary (dev/ino)" };
             return .{ .shift = false, .reason = "args[1] is not this binary" };
         }
         // stat unavailable: fall back to exact path equality, then to the
         // weaker loader-context + regular-file combination.
         if (std.mem.eql(u8, a1, env_path))
-            return .{ .shift = true, .reason = real_exe_env ++ " set; args[1] equals it" };
+            return .{ .shift = true, .verified = true, .reason = real_exe_env ++ " set; args[1] equals it" };
         if (ev.loaderContext() and ev.arg1_is_regular_file)
             return .{ .shift = true, .reason = reason_existing_file };
         return .{ .shift = false, .reason = "args[1] could not be identified as this binary" };
@@ -102,6 +105,8 @@ pub const Normalized = struct {
     /// pass this to argsFree -- free the original slice.
     args: [][:0]u8,
     shifted: bool,
+    /// The shift rested on positive identification of args[1] as this binary.
+    verified: bool,
     reason: []const u8,
     /// The evidence the verdict rests on; also drives real-exe-dir resolution.
     ev: Evidence,
@@ -115,39 +120,50 @@ pub fn normalizeArgs(raw: [][:0]u8) Normalized {
     return .{
         .args = if (v.shift) raw[1..] else raw,
         .shifted = v.shift,
+        .verified = v.verified,
         .reason = v.reason,
         .ev = ev,
     };
 }
 
 /// Directory of the REAL executable (allocated), from the same evidence that
-/// drove the shift decision. Trust order: a shifted argv[0] (that path was
-/// just verified to be this binary), then /proc/self/exe when it doesn't name
-/// the system linker, then the env marker -- but only in loader context, so a
-/// stale inherited variable can never override a working /proc/self/exe.
+/// drove the shift decision. Trust order:
+///   1. a shifted argv[0] whose file was positively identified as this binary;
+///   2. /proc/self/exe -- masked when the auxv mismatch proves a loader is in
+///      front of us, because then /proc/self/exe names the LOADER, whatever it
+///      is called (bionic linker64, glibc ld-linux, anything). A linker-like
+///      basename on a kernel load (auxv match) is just this binary's own name
+///      and stays trusted;
+///   3. a shifted argv[0] from the loader-context heuristic tier;
+///   4. the env marker, in loader context only, so a stale inherited variable
+///      can never override a working /proc/self/exe.
 pub fn realExeDirAlloc(alloc: std.mem.Allocator, norm: *const Normalized) ?[]u8 {
-    if (norm.shifted and norm.args.len > 0) {
-        const a0 = norm.args[0];
-        if (std.fs.path.isAbsolute(a0)) {
-            if (std.fs.path.dirname(a0)) |d| return alloc.dupe(u8, d) catch null;
-        }
+    if (norm.shifted and norm.verified and norm.args.len > 0) {
+        if (dupeDirname(alloc, norm.args[0])) |d| return d;
     }
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (selfExeReal(&buf)) |p| {
-        if (!(builtin.os.tag == .linux and basenameIsLinker(p))) {
+    if (!norm.ev.auxv_mismatch) {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (selfExeReal(&buf)) |p| {
             if (std.fs.path.dirname(p)) |d| return alloc.dupe(u8, d) catch null;
         }
+    }
+    if (norm.shifted and norm.args.len > 0) {
+        if (dupeDirname(alloc, norm.args[0])) |d| return d;
     }
     if (builtin.os.tag == .linux) {
         if (norm.ev.loaderContext()) {
             if (norm.ev.env_real_exe) |p| {
-                if (std.fs.path.isAbsolute(p)) {
-                    if (std.fs.path.dirname(p)) |d| return alloc.dupe(u8, d) catch null;
-                }
+                if (dupeDirname(alloc, p)) |d| return d;
             }
         }
     }
     return null;
+}
+
+fn dupeDirname(alloc: std.mem.Allocator, path: []const u8) ?[]u8 {
+    if (!std.fs.path.isAbsolute(path)) return null;
+    const d = std.fs.path.dirname(path) orelse return null;
+    return alloc.dupe(u8, d) catch null;
 }
 
 /// This process's executable path: /proc/self/exe (selfExePath), with an
@@ -365,6 +381,43 @@ test "basenameIsLinker" {
     try t.expect(!basenameIsLinker("xlinker"));
     try t.expect(!basenameIsLinker(""));
     try t.expect(basenameIsLinker("some/linker64"));
+}
+
+test "realExeDirAlloc: identity-verified argv[0] wins; heuristic defers to self exe" {
+    if (builtin.os.tag == .windows) {
+        var a0 = "C:\\miner\\zig-miner".*;
+        var argv = [_][:0]u8{&a0};
+        try exeDirTierChecks(&argv, "C:\\miner");
+    } else {
+        var a0 = "/opt/miner/zig-miner".*;
+        var argv = [_][:0]u8{&a0};
+        try exeDirTierChecks(&argv, "/opt/miner");
+    }
+}
+
+fn exeDirTierChecks(argv: [][:0]u8, want_dir: []const u8) !void {
+    const alloc = t.allocator;
+
+    var norm: Normalized = .{ .args = argv, .shifted = true, .verified = true, .reason = "", .ev = .{} };
+    const d1 = realExeDirAlloc(alloc, &norm) orelse return error.TestUnexpectedResult;
+    defer alloc.free(d1);
+    try t.expect(std.mem.eql(u8, d1, want_dir));
+
+    // An unverified (loader-heuristic) shift must NOT outrank the running
+    // executable's own directory.
+    norm.verified = false;
+    const d2 = realExeDirAlloc(alloc, &norm) orelse return error.TestUnexpectedResult;
+    defer alloc.free(d2);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const self = try std.fs.selfExePath(&buf);
+    try t.expect(std.mem.eql(u8, d2, std.fs.path.dirname(self).?));
+
+    // Under a proven loader (auxv mismatch) /proc/self/exe names the loader,
+    // so the shifted argv[0] must win even without identity verification.
+    norm.ev.auxv_mismatch = true;
+    const d3 = realExeDirAlloc(alloc, &norm) orelse return error.TestUnexpectedResult;
+    defer alloc.free(d3);
+    try t.expect(std.mem.eql(u8, d3, want_dir));
 }
 
 test "normalizeArgs: view semantics on a no-shift launch" {
