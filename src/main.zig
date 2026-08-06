@@ -110,6 +110,7 @@ fn usage() void {
         \\  -w  DERO wallet address            (default from config.json / built-in)
         \\  -t  mining threads                 (default: logical CPU count)
         \\  -c, --config-file <path>           config file (default: config.json)
+        \\  -p, --priority <n>                 process priority (accepted for compatibility; not yet applied)
         \\  -V  verbose
         \\  --selftest  run pow("a") KAT and exit (0=PASS,1=FAIL)
         \\  --bench     run an AstroBWTv3 hashrate benchmark (~5s) and exit
@@ -117,6 +118,14 @@ fn usage() void {
         \\  -h, --help / -v, --version
         \\
     , .{});
+}
+
+/// Print a CLI error followed by usage; returns the process exit code so call
+/// sites read `return flagError(...)`.
+fn flagError(comptime fmt: []const u8, fargs: anytype) u8 {
+    std.debug.print("error: " ++ fmt ++ "\n", fargs);
+    usage();
+    return 1;
 }
 
 /// Run the pow("a") known-answer test, writing the lowercase hex digest into `hex_out`.
@@ -1150,18 +1159,23 @@ pub fn main() !u8 {
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.eql(u8, a, "-d") and i + 1 < args.len) {
+        if (std.mem.eql(u8, a, "-d")) {
             i += 1;
+            if (i >= args.len) return flagError("{s} requires a value", .{a});
             cfg_daemon = args[i];
             setDaemon(args[i]);
-        } else if ((std.mem.eql(u8, a, "-c") or std.mem.eql(u8, a, "--config-file")) and i + 1 < args.len) {
-            i += 1; // already applied in the config-loading block above
-        } else if (std.mem.eql(u8, a, "-w") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, a, "-c") or std.mem.eql(u8, a, "--config-file")) {
+            i += 1; // value applied in the config-loading block above
+            if (i >= args.len) return flagError("{s} requires a value", .{a});
+        } else if (std.mem.eql(u8, a, "-w")) {
             i += 1;
+            if (i >= args.len) return flagError("{s} requires a value", .{a});
             G.wallet = args[i];
-        } else if (std.mem.eql(u8, a, "-t") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, a, "-t")) {
             i += 1;
-            nthreads = std.fmt.parseInt(usize, args[i], 10) catch 0;
+            if (i >= args.len) return flagError("{s} requires a value", .{a});
+            nthreads = std.fmt.parseInt(usize, args[i], 10) catch
+                return flagError("-t: invalid thread count '{s}'", .{args[i]});
         } else if (std.mem.eql(u8, a, "-V") or std.mem.eql(u8, a, "--verbose")) {
             g_verbose = true;
         } else if (std.mem.eql(u8, a, "--selftest")) {
@@ -1171,7 +1185,10 @@ pub fn main() !u8 {
         } else if (std.mem.eql(u8, a, "--setup")) {
             do_setup = true;
         } else if (std.mem.eql(u8, a, "-p") or std.mem.eql(u8, a, "--priority")) {
-            i += 1; // accepted for CLI compatibility; not yet used
+            i += 1; // accepted for CLI compatibility; not yet applied
+            if (i >= args.len) return flagError("{s} requires a value", .{a});
+            _ = std.fmt.parseInt(i64, args[i], 10) catch
+                return flagError("{s}: invalid priority '{s}'", .{ a, args[i] });
         } else if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
             usage();
             return 0;
@@ -1179,8 +1196,7 @@ pub fn main() !u8 {
             std.debug.print("zig-miner v{s}\n", .{VERSION});
             return 0;
         } else {
-            usage();
-            return 1;
+            return flagError("unknown argument: '{s}'", .{a});
         }
     }
 
