@@ -97,6 +97,59 @@ jobs:
           grep -q 'pow(a): .* PASS' arm64-fallback.log
           grep -q 'hash2 parity: PASS' arm64-fallback.log
 
+      # Termux on Android 10+ actually launches binaries as
+      #   execve("/system/bin/linker64", [argv0, "/abs/path/zig-miner", args...])
+      # and bionic never rewrites the kernel argument block, so a static binary
+      # sees its own path at argv[1]. Simulate the evidence tiers the argv shim
+      # keys on and assert WHICH tier fired via --argdiag, not just that the
+      # KAT passed. (The auxv-identity tier cannot be simulated here: qemu-user
+      # synthesizes a matching AT_PHDR; unit tests cover it.) The on-device run
+      # remains the authoritative Termux check.
+      - name: Termux linker-exec argv simulations
+        shell: bash
+        run: |
+          BIN=out-arm64/bin/zig-miner
+          # dev/ino tier: env marker absolute, argv[1] deliberately RELATIVE so
+          # exact-string equality cannot mask a broken fstatat comparison.
+          TERMUX_EXEC__PROC_SELF_EXE="$PWD/$BIN" \
+            qemu-aarch64-static "$BIN" "./$BIN" --argdiag 2>&1 | tee sim-a-diag.log
+          grep -q 'verdict : SHIFT' sim-a-diag.log
+          grep -q 'args\[1\] is this binary (dev/ino)' sim-a-diag.log
+          TERMUX_EXEC__PROC_SELF_EXE="$PWD/$BIN" \
+            qemu-aarch64-static "$BIN" "./$BIN" --selftest 2>&1 | tee sim-a.log
+          grep -q 'pow(a): .* PASS' sim-a.log
+          # loader-name tier: no env marker; the binary runs under the name
+          # linker64, so /proc/self/exe (qemu reports the guest path) carries
+          # the evidence and argv[1] must be an existing regular file.
+          cp "$BIN" linker64
+          qemu-aarch64-static ./linker64 "$PWD/$BIN" --argdiag 2>&1 | tee sim-b-diag.log
+          grep -q 'verdict : SHIFT' sim-b-diag.log
+          grep -q 'args\[1\] is an existing file' sim-b-diag.log
+          qemu-aarch64-static ./linker64 "$PWD/$BIN" --selftest 2>&1 | tee sim-b.log
+          grep -q 'pow(a): .* PASS' sim-b.log
+          # over-shift veto: env names the real binary but argv[1] is a decoy
+          # file -- the dev/ino mismatch must refuse the shift and fail loudly.
+          echo decoy > decoy.bin
+          set +e
+          TERMUX_EXEC__PROC_SELF_EXE="$PWD/$BIN" \
+            qemu-aarch64-static "$BIN" "$PWD/decoy.bin" -V 2>decoy.log
+          rc=$?
+          set -e
+          [ "$rc" -eq 1 ] || { echo "ERROR: decoy expected exit 1, got $rc"; cat decoy.log; exit 1; }
+          grep -q 'args\[1\] is not this binary' decoy.log
+          grep -q 'unknown argument:' decoy.log
+          # --argdiag must report a real auxv value on a plain launch and exit
+          # 0 (pipefail via shell: bash makes the qemu status load-bearing).
+          qemu-aarch64-static "$BIN" --argdiag 2>&1 | tee argdiag.log
+          grep -qE 'AT_PHDR \(auxv\) : 0x[0-9a-f]+' argdiag.log
+          # unknown arguments fail loudly, not with bare usage.
+          set +e
+          qemu-aarch64-static "$BIN" --definitely-bogus 2>bogus.log
+          rc=$?
+          set -e
+          [ "$rc" -eq 1 ] || { echo "ERROR: expected exit 1, got $rc"; cat bogus.log; exit 1; }
+          grep -q "unknown argument: '--definitely-bogus'" bogus.log
+
   hygiene:
     name: Repo Hygiene
     runs-on: ubuntu-latest

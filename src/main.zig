@@ -11,6 +11,7 @@ const console = @import("console.zig");
 const pages = @import("pages.zig");
 const cpu_features = @import("cpu_features.zig");
 const sha_mb = @import("sha256_mb.zig");
+const linker_exec = @import("linker_exec.zig");
 const build_options = @import("build_options");
 
 const VERSION = build_options.version;
@@ -109,13 +110,28 @@ fn usage() void {
         \\  -w  DERO wallet address            (default from config.json / built-in)
         \\  -t  mining threads                 (default: logical CPU count)
         \\  -c, --config-file <path>           config file (default: config.json)
+        \\  -p, --priority <n|max>             process priority (accepted for compatibility; not yet applied)
         \\  -V  verbose
         \\  --selftest  run pow("a") KAT and exit (0=PASS,1=FAIL)
         \\  --bench     run an AstroBWTv3 hashrate benchmark (~5s) and exit
         \\  --setup     interactively write config.json (pool/wallet/threads), then exit
+        \\  --argdiag   print launch diagnostics (argv/auxv/linker-exec detection) and exit
         \\  -h, --help / -v, --version
         \\
     , .{});
+}
+
+/// Print a CLI error followed by usage; returns the process exit code so call
+/// sites read `return flagError(...)`.
+fn flagError(comptime fmt: []const u8, fargs: anytype) u8 {
+    std.debug.print("error: " ++ fmt ++ "\n", fargs);
+    usage();
+    return 1;
+}
+
+fn parsesAsInt(s: []const u8) bool {
+    _ = std.fmt.parseInt(i64, s, 10) catch return false;
+    return true;
 }
 
 /// Run the pow("a") known-answer test, writing the lowercase hex digest into `hex_out`.
@@ -937,10 +953,10 @@ fn setDaemon(hp_in: []const u8) void {
     G.tls = explicit_tls orelse true; // DERO getwork is TLS; bare addresses connect over wss://
 }
 
-/// Absolute path to config.json next to the running executable, or null if unresolved.
-fn exeConfigPath(alloc: std.mem.Allocator) ?[]u8 {
-    const dir = std.fs.selfExeDirPathAlloc(alloc) catch return null;
-    defer alloc.free(dir);
+/// Absolute path to config.json inside the real executable's directory (as
+/// resolved once in main() via linker_exec), or null if unresolved.
+fn exeConfigPath(alloc: std.mem.Allocator, exe_dir: ?[]const u8) ?[]u8 {
+    const dir = exe_dir orelse return null;
     return std.fs.path.join(alloc, &.{ dir, "config.json" }) catch null;
 }
 
@@ -1100,8 +1116,28 @@ pub fn main() !u8 {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    const raw_args = try std.process.argsAlloc(alloc);
+    // argsFree must get the ORIGINAL slice; `args` below may be a shifted view of it.
+    defer std.process.argsFree(alloc, raw_args);
+
+    // --argdiag must dispatch BEFORE normalization: on a launch where the
+    // shift wrongly didn't fire, the parse loop would reject the injected
+    // path at args[1] and never reach the one flag that diagnoses exactly
+    // that state. Skip index 0 -- argv[0] is a name, not a flag.
+    if (raw_args.len > 1) for (raw_args[1..]) |a| {
+        if (std.mem.eql(u8, a, "--argdiag")) return linker_exec.argDiag(VERSION, raw_args);
+    };
+
+    // Android/Termux launches through the system linker leave the binary's own
+    // path in argv ahead of the real flags; normalize before any parsing.
+    const norm = linker_exec.normalizeArgs(raw_args);
+    const args = norm.args;
+    if (norm.shifted) std.debug.print("launch : android linker-exec detected -- argv normalized\n", .{});
+
+    // One resolution of the real executable's directory serves both the
+    // config.json read below and --setup's write; the two must agree.
+    const exe_dir: ?[]u8 = linker_exec.realExeDirAlloc(alloc, &norm);
+    defer if (exe_dir) |d| alloc.free(d);
 
     var do_selftest = false;
     var do_bench = false;
@@ -1128,7 +1164,7 @@ pub fn main() !u8 {
         if (explicit_cfg) |p| {
             loaded = loadConfig(alloc, p, &nthreads, &cfg_daemon, &cfg_threads);
         } else {
-            if (exeConfigPath(alloc)) |ep| {
+            if (exeConfigPath(alloc, exe_dir)) |ep| {
                 defer alloc.free(ep);
                 loaded = loadConfig(alloc, ep, &nthreads, &cfg_daemon, &cfg_threads);
             }
@@ -1140,18 +1176,27 @@ pub fn main() !u8 {
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.eql(u8, a, "-d") and i + 1 < args.len) {
+        if (std.mem.eql(u8, a, "-d")) {
             i += 1;
+            if (i >= args.len) return flagError("{s} requires a value", .{a});
             cfg_daemon = args[i];
             setDaemon(args[i]);
-        } else if ((std.mem.eql(u8, a, "-c") or std.mem.eql(u8, a, "--config-file")) and i + 1 < args.len) {
-            i += 1; // already applied in the config-loading block above
-        } else if (std.mem.eql(u8, a, "-w") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, a, "-c") or std.mem.eql(u8, a, "--config-file")) {
+            i += 1; // value applied in the config-loading block above
+            if (i >= args.len) return flagError("{s} requires a value", .{a});
+        } else if (std.mem.eql(u8, a, "-w")) {
             i += 1;
+            // Leading-dash guard: a swallowed flag here would MINE TO IT.
+            if (i >= args.len or args[i].len == 0 or args[i][0] == '-')
+                return flagError("{s} requires a value", .{a});
             G.wallet = args[i];
-        } else if (std.mem.eql(u8, a, "-t") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, a, "-t")) {
             i += 1;
-            nthreads = std.fmt.parseInt(usize, args[i], 10) catch 0;
+            if (i >= args.len) return flagError("{s} requires a value", .{a});
+            // Signed on purpose: "-1"/"0" mean auto-detect (README flag table).
+            const tv = std.fmt.parseInt(i64, args[i], 10) catch
+                return flagError("-t: invalid thread count '{s}' (number, -1/0 = auto)", .{args[i]});
+            nthreads = if (tv <= 0) 0 else @intCast(tv);
         } else if (std.mem.eql(u8, a, "-V") or std.mem.eql(u8, a, "--verbose")) {
             g_verbose = true;
         } else if (std.mem.eql(u8, a, "--selftest")) {
@@ -1161,16 +1206,30 @@ pub fn main() !u8 {
         } else if (std.mem.eql(u8, a, "--setup")) {
             do_setup = true;
         } else if (std.mem.eql(u8, a, "-p") or std.mem.eql(u8, a, "--priority")) {
-            i += 1; // accepted for CLI compatibility; not yet used
+            // Value-agnostic on purpose: the C miner's spelling is `-p max`, and
+            // this flag exists for that CLI compatibility (value not yet applied).
+            // A leading dash is accepted only when it reads as a number, so
+            // `-p -1` works but `-p -V` cannot swallow the next flag.
+            i += 1;
+            if (i >= args.len or args[i].len == 0 or
+                (args[i][0] == '-' and !parsesAsInt(args[i])))
+                return flagError("{s} requires a value", .{a});
         } else if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
             usage();
             return 0;
         } else if (std.mem.eql(u8, a, "-v") or std.mem.eql(u8, a, "--version")) {
             std.debug.print("zig-miner v{s}\n", .{VERSION});
             return 0;
+        } else if (std.mem.eql(u8, a, "--argdiag")) {
+            // Normally handled by the pre-normalization scan above; this
+            // branch keeps the documented flag alive if that scan ever moves.
+            return linker_exec.argDiag(VERSION, raw_args);
         } else {
-            usage();
-            return 1;
+            // A non-flag token here is the signature of an undetected
+            // loader-injected argv (the argv-shift declined); say why.
+            if (a.len > 0 and a[0] != '-')
+                std.debug.print("note: launch detection: {s} -- run 'zig-miner --argdiag' for details\n", .{norm.reason});
+            return flagError("unknown argument: '{s}'", .{a});
         }
     }
 
@@ -1195,7 +1254,7 @@ pub fn main() !u8 {
         var wpath_owned: ?[]u8 = null;
         defer if (wpath_owned) |p| alloc.free(p);
         const wpath: []const u8 = if (explicit_cfg) |p| p else blk: {
-            wpath_owned = exeConfigPath(alloc);
+            wpath_owned = exeConfigPath(alloc, exe_dir);
             break :blk (wpath_owned orelse "config.json");
         };
         const f = (if (std.fs.path.isAbsolute(wpath))
@@ -1217,11 +1276,7 @@ pub fn main() !u8 {
     if (do_selftest) return selftest(alloc);
     if (do_bench) return bench(alloc);
 
-    if (G.wallet.len == 0) {
-        std.debug.print("error: -w <wallet> is required\n", .{});
-        usage();
-        return 1;
-    }
+    if (G.wallet.len == 0) return flagError("-w <wallet> is required", .{});
 
     if (nthreads == 0) nthreads = std.Thread.getCpuCount() catch 4;
     G.nthreads = nthreads;

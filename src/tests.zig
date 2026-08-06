@@ -25,5 +25,6 @@ test {
     _ = @import("pages.zig");
     _ = @import("cpu_features.zig");
     _ = @import("console.zig");
+    _ = @import("linker_exec.zig");
     _ = @import("main.zig");
 }
