@@ -11,6 +11,7 @@ const console = @import("console.zig");
 const pages = @import("pages.zig");
 const cpu_features = @import("cpu_features.zig");
 const sha_mb = @import("sha256_mb.zig");
+const linker_exec = @import("linker_exec.zig");
 const build_options = @import("build_options");
 
 const VERSION = build_options.version;
@@ -937,9 +938,11 @@ fn setDaemon(hp_in: []const u8) void {
     G.tls = explicit_tls orelse true; // DERO getwork is TLS; bare addresses connect over wss://
 }
 
-/// Absolute path to config.json next to the running executable, or null if unresolved.
-fn exeConfigPath(alloc: std.mem.Allocator) ?[]u8 {
-    const dir = std.fs.selfExeDirPathAlloc(alloc) catch return null;
+/// Absolute path to config.json next to the real executable, or null if unresolved.
+/// Resolution sees through Android's system_linker_exec (where /proc/self/exe names
+/// the system linker, not this binary); argv0 is the normalized argv[0] fallback.
+fn exeConfigPath(alloc: std.mem.Allocator, argv0: ?[]const u8) ?[]u8 {
+    const dir = linker_exec.realExeDirAlloc(alloc, argv0) orelse return null;
     defer alloc.free(dir);
     return std.fs.path.join(alloc, &.{ dir, "config.json" }) catch null;
 }
@@ -1100,8 +1103,15 @@ pub fn main() !u8 {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    const raw_args = try std.process.argsAlloc(alloc);
+    // argsFree must get the ORIGINAL slice; `args` below may be a shifted view of it.
+    defer std.process.argsFree(alloc, raw_args);
+
+    // Android/Termux launches through the system linker leave the binary's own
+    // path in argv ahead of the real flags; normalize before any parsing.
+    const norm = linker_exec.normalizeArgs(raw_args);
+    const args = norm.args;
+    if (norm.shifted) std.debug.print("launch : android linker-exec detected -- argv normalized\n", .{});
 
     var do_selftest = false;
     var do_bench = false;
@@ -1128,7 +1138,7 @@ pub fn main() !u8 {
         if (explicit_cfg) |p| {
             loaded = loadConfig(alloc, p, &nthreads, &cfg_daemon, &cfg_threads);
         } else {
-            if (exeConfigPath(alloc)) |ep| {
+            if (exeConfigPath(alloc, if (args.len > 0) args[0] else null)) |ep| {
                 defer alloc.free(ep);
                 loaded = loadConfig(alloc, ep, &nthreads, &cfg_daemon, &cfg_threads);
             }
@@ -1195,7 +1205,7 @@ pub fn main() !u8 {
         var wpath_owned: ?[]u8 = null;
         defer if (wpath_owned) |p| alloc.free(p);
         const wpath: []const u8 = if (explicit_cfg) |p| p else blk: {
-            wpath_owned = exeConfigPath(alloc);
+            wpath_owned = exeConfigPath(alloc, if (args.len > 0) args[0] else null);
             break :blk (wpath_owned orelse "config.json");
         };
         const f = (if (std.fs.path.isAbsolute(wpath))
