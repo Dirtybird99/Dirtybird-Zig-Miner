@@ -27,18 +27,36 @@
 //! src/sa_v114_check.zig.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 // Max suffix-array length. Must equal astrobwt.SCRATCH; a comptime check in
 // astrobwt.zig enforces it. Kept as a local constant so this module does NOT
 // import astrobwt -- astrobwt imports THIS (for the Scratch type + the Worker
 // SA field), and a mutual import would be a cycle.
 pub const SCRATCH: usize = 72000 + 64;
+
+/// True on x86-64 builds that carry full AVX-512 (F+BW). The widened kernels
+/// below (64-byte suffix compares, 16-wide arena copies) pay off there: the
+/// 64-byte compare lowers to a single vpcmpb + kmovq pair, and the 16-wide
+/// copies to one zmm load/store. On AVX2-only targets LLVM would split every
+/// 64-byte vector into YMM halves (no gain, extra instructions), so the wide
+/// path is gated OFF there and the codegen stays byte-identical to the shipped
+/// x86_64_v3+sha baseline. Non-x86 targets keep the narrow path too (NEON
+/// splits are correct but untested here). The miner never mixes the wide SA
+/// kernels with the legacy-SSE SHA-NI asm on a non-AVX-512 build.
+const wide_ok = builtin.cpu.arch == .x86_64 and
+    std.Target.x86.featureSetHasAll(builtin.cpu.features, .{ .avx512f, .avx512bw });
 const MAX_GROUP: u32 = 512; // kStage4MaxGroupCount; actual group_count <= data_len>>8
 
 // A run packed into one u64 -- 24-bit big-endian 3-byte key in bits [40..63],
 // arena begin in bits [10..39] (begin < SCRATCH < 2^17), length in bits [0..9]
 // (len <= MAX_GROUP = 512). 8 bytes/run instead of a 12-byte struct, so the
 // radix passes and the materialize table walk stream 33% fewer bytes.
+
+/// 64-byte vector used by the suffix comparator and the 16-wide arena copies
+/// on +avx512 builds only (see `wide_ok`).
+const V64u8 = @Vector(64, u8);
+const V16u32 = @Vector(16, u32);
 const Run = u64;
 const RUN_KEY_SHIFT: u6 = 40;
 const RUN_BEGIN_SHIFT: u6 = 10;
@@ -133,7 +151,24 @@ const SuffixCtx = struct {
         const blen = ctx.n - b;
         const common = @min(alen, blen);
         var i: u32 = 0;
-        // 8 bytes at a time, big-endian so numeric order == lexicographic.
+        // 64 bytes at a time (AVX-512 only, see `wide_ok`): equal-compare the
+        // lanes, jump to the first differing byte via a movemask +
+        // count-trailing-zeros (one bit per byte). This lowers to a single
+        // vpcmpb + kmovq pair per 64 bytes. The Wolf-permuted data has a deep
+        // mean LCP (~68 bytes), so this loop is the whole cost of the pdq
+        // sorts in the emit/materialize phases.
+        if (comptime wide_ok) {
+            while (i + 64 <= common) : (i += 64) {
+                const va: V64u8 = ctx.data[a + i ..][0..64].*;
+                const vb: V64u8 = ctx.data[b + i ..][0..64].*;
+                const eqbits: u64 = @bitCast(va == vb);
+                if (eqbits != 0xFFFF_FFFF_FFFF_FFFF) {
+                    const off: u32 = @ctz(~eqbits);
+                    return ctx.data[a + i + off] < ctx.data[b + i + off];
+                }
+            }
+        }
+        // 8-byte tail: big-endian load makes the u64 compare a lexicographic compare.
         while (i + 8 <= common) : (i += 8) {
             const av = std.mem.readInt(u64, ctx.data[a + i ..][0..8], .big);
             const bv = std.mem.readInt(u64, ctx.data[b + i ..][0..8], .big);
@@ -242,12 +277,13 @@ const Builder = struct {
 /// Build the suffix array of data[0..n) into sa_out[0..n) using the group-run
 /// structure encoded in `flags` ((n>>8)+1 bytes; flags[g]!=0 starts a new
 /// group-run). `data` must be zero-padded >=3 bytes past n-1. `sa_out` must
-/// have capacity for at least n+7 elements (a SCRATCH-sized buffer like
-/// Worker.sa satisfies this): the materialize stage's unconditional 8-wide
-/// stores leave up to 7 scratch lanes past sa_out[n-1] on the final bucket.
+/// have capacity for at least n + copy_width elements (a SCRATCH-sized buffer
+/// like Worker.sa satisfies this; copy_width is 8 on the narrow path, 16 on
+/// AVX-512 builds): the materialize stage's unconditional wide stores leave up
+/// to copy_width-1 scratch lanes past sa_out[n-1] on the final bucket.
 /// sa_out[0..n) is the canonical SA (byte-identical to libsais).
 pub fn buildSA(sc: *Scratch, data: [*]const u8, n: u32, flags: [*]const u8, sa_out: [*]i32) void {
-    std.debug.assert(n + 8 <= SCRATCH); // 8-wide copies need tail slack in every buffer
+    std.debug.assert(n + (if (comptime wide_ok) @as(usize, 16) else 8) <= SCRATCH); // wide copies need tail slack in every buffer
     var b = Builder{ .sc = sc, .data = data, .ctx = .{ .data = data, .n = n } };
     const full_groups: u32 = n >> 8;
     var order: [MAX_GROUP]u32 = undefined;
@@ -287,16 +323,20 @@ pub fn buildSA(sc: *Scratch, data: [*]const u8, n: u32, flags: [*]const u8, sa_o
             const rl = runLen(r);
             const rb = runBegin(r);
             if (INSTRUMENT) stat_single_pos += rl;
-            // One unconditional 8-wide copy covers rl<=8 (the common case,
-            // avg run len ~3.5) with no data-dependent branch; out_pos only
-            // advances by rl, so over-copied lanes are overwritten by the next
-            // run -- except after the FINAL bucket, which leaves up to 7
-            // scratch lanes past sa_out[n-1] (hence the documented n+7
-            // capacity requirement). In-bounds by the >=64-element tail slack
-            // (rb < arena_len <= 72000, out_pos <= n - rl, SCRATCH = 72064).
-            const v: @Vector(8, u32) = sc.arena[rb..][0..8].*;
-            @as([*]u32, @ptrCast(sa_out))[out_pos..][0..8].* = v;
-            var k: u32 = 8;
+            // One unconditional wide copy covers rl <= copy_width (the common
+            // case, avg run len ~3.5) with no data-dependent branch; out_pos
+            // only advances by rl, so over-copied lanes are overwritten by the
+            // next run -- except after the FINAL bucket, which leaves up to
+            // copy_width-1 scratch lanes past sa_out[n-1] (hence the documented
+            // tail-slack requirement; n <= 70911 < SCRATCH-copy_width).
+            if (comptime wide_ok) {
+                const v: V16u32 = sc.arena[rb..][0..16].*;
+                @as([*]u32, @ptrCast(sa_out))[out_pos..][0..16].* = v;
+            } else {
+                const v: @Vector(8, u32) = sc.arena[rb..][0..8].*;
+                @as([*]u32, @ptrCast(sa_out))[out_pos..][0..8].* = v;
+            }
+            var k: u32 = if (comptime wide_ok) 16 else 8;
             while (k < rl) : (k += 1) sa_out[out_pos + k] = @intCast(sc.arena[rb + k]);
             out_pos += rl;
         } else {
@@ -306,9 +346,14 @@ pub fn buildSA(sc: *Scratch, data: [*]const u8, n: u32, flags: [*]const u8, sa_o
                 const r = sc.runs[t];
                 const rl = runLen(r);
                 const rb = runBegin(r);
-                const v: @Vector(8, u32) = sc.arena[rb..][0..8].*;
-                sc.tmp[m..][0..8].* = v;
-                var k: u32 = 8;
+                if (comptime wide_ok) {
+                    const v: V16u32 = sc.arena[rb..][0..16].*;
+                    sc.tmp[m..][0..16].* = v;
+                } else {
+                    const v: @Vector(8, u32) = sc.arena[rb..][0..8].*;
+                    sc.tmp[m..][0..8].* = v;
+                }
+                var k: u32 = if (comptime wide_ok) 16 else 8;
                 while (k < rl) : (k += 1) sc.tmp[m + k] = sc.arena[rb + k];
                 m += rl;
             }
