@@ -332,9 +332,9 @@ pub fn recommendedAffinityForThreads(n: usize) [MAX_AFFINITY]u7 {
     if (comptime builtin.os.tag == .windows) {
         // Fixed i7-13700HX layout: 8 distinct P-core physicals, 8 E-cores, 8 HT siblings.
         const order = [_]u7{
-            0,  2,  4,  6,  8,  10, 12, 14, // 8 distinct P-core physicals
+            0, 2, 4, 6, 8, 10, 12, 14, // 8 distinct P-core physicals
             16, 17, 18, 19, 20, 21, 22, 23, // 8 E-cores (no HT)
-            1,  3,  5,  7,  9,  11, 13, 15, // 8 P-core HT siblings
+            1, 3, 5, 7, 9, 11, 13, 15, // 8 P-core HT siblings
         };
         for (0..@min(count, order.len)) |i| result[i] = order[i];
     } else if (comptime builtin.os.tag == .linux) {
