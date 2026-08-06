@@ -219,9 +219,15 @@ pub fn setProcessHighPriority() void {
 /// Pin the calling thread to a single logical processor `cpu` (0-based).
 /// Windows: SetThreadAffinityMask; Linux: sched_setaffinity(0).
 /// Out-of-range or disallowed CPUs silently no-op (both OSes reject the bits).
+/// On Windows that includes any index past the caller's processor group, which
+/// holds at most @bitSizeOf(ULONG_PTR) logical processors.
 pub fn pinThreadToLogical(cpu: u7) void {
     if (builtin.os.tag == .windows) {
-        const mask: ULONG_PTR = @as(ULONG_PTR, 1) << cpu;
+        // SetThreadAffinityMask only ever addresses the caller's own processor
+        // group; reaching a higher group needs SetThreadGroupAffinity. Skip those
+        // indices rather than let the shift wrap onto the wrong core.
+        if (cpu >= @bitSizeOf(ULONG_PTR)) return;
+        const mask: ULONG_PTR = @as(ULONG_PTR, 1) << @intCast(cpu);
         _ = SetThreadAffinityMask(GetCurrentThread(), mask);
     } else if (builtin.os.tag == .linux) {
         var set: std.os.linux.cpu_set_t = @splat(0);
