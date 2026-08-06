@@ -31,13 +31,15 @@ inline fn writeNonce(blob: *[BLOB_LEN]u8, nonce: u32) void {
 /// (~1.3x on the final-SHA stage -> ~5-8% overall vs single-stream). `w0`/`w1` are
 /// this thread's two private scratch workers (one per lane).
 pub fn mineThread(s: *MinerState, tid: usize, w0: *pow.Worker, w1: *pow.Worker) void {
-    // Pin to a dedicated logical CPU (P-cores first, then E-cores; HT siblings
-    // last) and disable power throttling -- AstroBWTv3 is memory/cache-bound, so
-    // distinct physical cores beat HT siblings (measured +12% over the default
-    // scheduler, and HT-sibling packing is ~25% worse).
-    if (builtin.os.tag == .windows) {
+    // Pin to a dedicated logical CPU (one thread per distinct physical core
+    // first, then SMT siblings) and raise thread priority -- AstroBWTv3 is
+    // memory/cache-bound, so distinct physical cores beat HT siblings (measured
+    // +12% over the default scheduler, and HT-sibling packing is ~25% worse).
+    // Windows: fixed i7-13700HX layout. Linux: topology discovered from sysfs,
+    // so AMD Zen4/Zen5 and Intel hybrid both get one-thread-per-core first.
+    if (builtin.os.tag == .windows or builtin.os.tag == .linux) {
         const map = system.recommendedAffinityForThreads(s.nthreads);
-        system.pinThreadToLogical(map[@min(tid, 23)]);
+        system.pinThreadToLogical(map[@min(tid, system.MAX_AFFINITY - 1)]);
         system.setThreadHighPriority();
     }
 

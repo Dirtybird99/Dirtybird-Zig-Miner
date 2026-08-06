@@ -14,6 +14,7 @@
 //! When built via build.zig, kernel32 and advapi32 are pulled in automatically.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const windows = std.os.windows;
 
 // ── Win32 base types ─────────────────────────────────────────────────────────
@@ -202,49 +203,78 @@ pub fn freeLargePages(buf: []align(4096) u8) void {
     _ = VirtualFree(@ptrCast(buf.ptr), 0, MEM_RELEASE);
 }
 
-// ── 3. pinThreadToLogical ─────────────────────────────────────────────────────
-/// Pin the calling thread to a single logical processor `cpu` (0-based).
-///
-/// On i7-13700HX:
-///   Logical  0..15  = P-core HT siblings, paired as (0,1),(2,3),(4,5)...,(14,15)
-///   Logical 16..23  = E-cores (no HT)
-///
-/// SetThreadAffinityMask ignores calls that set bits outside the process affinity
-/// mask, so out-of-range `cpu` values will silently no-op.
-/// Raise the whole process to HIGH priority class (matches the C miner's `-p max`;
-/// base priority 13, so HIGHEST threads reach 15 instead of 10 under NORMAL class).
+// ── 3. pinThreadToLogical / setProcessHighPriority ─────────────────────────────
+/// Raise the whole process scheduling priority. Windows: HIGH priority class
+/// (matches the C miner's `-p max`; base priority 13, so HIGHEST threads reach 15
+/// instead of 10 under NORMAL class). Linux: best-effort nice -10 on the calling
+/// process (requires CAP_SYS_NICE below the session's rlimit; failure is ignored).
 pub fn setProcessHighPriority() void {
-    _ = SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    if (builtin.os.tag == .windows) {
+        _ = SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    } else if (builtin.os.tag == .linux) {
+        setLinuxPriority(-10);
+    }
 }
 
-pub fn pinThreadToLogical(cpu: u6) void {
-    const mask: ULONG_PTR = @as(ULONG_PTR, 1) << cpu;
-    _ = SetThreadAffinityMask(GetCurrentThread(), mask);
+/// Pin the calling thread to a single logical processor `cpu` (0-based).
+/// Windows: SetThreadAffinityMask; Linux: sched_setaffinity(0).
+/// Out-of-range or disallowed CPUs silently no-op (both OSes reject the bits).
+/// On Windows that includes any index past the caller's processor group, which
+/// holds at most @bitSizeOf(ULONG_PTR) logical processors.
+pub fn pinThreadToLogical(cpu: u7) void {
+    if (builtin.os.tag == .windows) {
+        // SetThreadAffinityMask only ever addresses the caller's own processor
+        // group; reaching a higher group needs SetThreadGroupAffinity. Skip those
+        // indices rather than let the shift wrap onto the wrong core.
+        if (cpu >= @bitSizeOf(ULONG_PTR)) return;
+        const mask: ULONG_PTR = @as(ULONG_PTR, 1) << @intCast(cpu);
+        _ = SetThreadAffinityMask(GetCurrentThread(), mask);
+    } else if (builtin.os.tag == .linux) {
+        var set: std.os.linux.cpu_set_t = @splat(0);
+        const word = @as(usize, cpu) / @bitSizeOf(usize);
+        const bit: u6 = @intCast(cpu % @bitSizeOf(usize));
+        set[word] |= @as(usize, 1) << bit;
+        std.os.linux.sched_setaffinity(0, &set) catch {};
+    }
+}
+
+// ── 3b. Linux priority (best-effort nice via raw syscall) ─────────────────────
+fn setLinuxPriority(nice: i32) void {
+    // setpriority(which=PRIO_PROCESS, who=0, prio=nice). Negative values below the
+    // RLIMIT_NICE floor need CAP_SYS_NICE; if denied, keep the inherited value.
+    _ = std.os.linux.syscall3(.setpriority, 0, 0, @bitCast(@as(isize, nice)));
 }
 
 // ── 4. setThreadHighPriority ──────────────────────────────────────────────────
 /// Elevate the calling thread's scheduling priority and disable power throttling.
 ///
+/// Windows:
 /// - SetThreadPriority(THREAD_PRIORITY_HIGHEST) — moves the thread into the
 ///   highest real-time-adjacent Windows priority bucket.
 /// - SetThreadInformation(ThreadPowerThrottling, StateMask=0) — tells the
 ///   scheduler to disable execution-speed throttling for this thread.
 ///   StateMask=0 with ControlMask=EXECUTION_SPEED means "do not throttle."
 ///   This call may fail on older Windows 10 builds; failure is silently ignored.
+///
+/// Linux: best-effort nice -10 for the calling thread (same privilege caveat).
 pub fn setThreadHighPriority() void {
-    _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    if (builtin.os.tag == .windows) {
+        _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
-    var pts = THREAD_POWER_THROTTLING_STATE{
-        .Version = THREAD_POWER_THROTTLING_CURRENT_VERSION,
-        .ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED,
-        .StateMask = 0, // 0 = do NOT throttle
-    };
-    _ = SetThreadInformation(
-        GetCurrentThread(),
-        ThreadPowerThrottling,
-        @ptrCast(&pts),
-        @sizeOf(THREAD_POWER_THROTTLING_STATE),
-    );
+        var pts = THREAD_POWER_THROTTLING_STATE{
+            .Version = THREAD_POWER_THROTTLING_CURRENT_VERSION,
+            .ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+            .StateMask = 0, // 0 = do NOT throttle
+        };
+        _ = SetThreadInformation(
+            GetCurrentThread(),
+            ThreadPowerThrottling,
+            @ptrCast(&pts),
+            @sizeOf(THREAD_POWER_THROTTLING_STATE),
+        );
+    } else if (builtin.os.tag == .linux) {
+        setLinuxPriority(-10);
+    }
 }
 
 // ── 4b. enableVirtualTerminal ─────────────────────────────────────────────────
@@ -270,43 +300,146 @@ pub fn enableVirtualTerminal() bool {
 }
 
 // ── 5. recommendedAffinityForThreads ─────────────────────────────────────────
+/// Maximum logical CPUs the affinity map can address. 128 matches Linux's
+/// CPU_SETSIZE and keeps the map small; callers index it with @min(tid, MAX-1).
+pub const MAX_AFFINITY: usize = 128;
+
 /// Return an ordered list of logical CPU IDs for n mining threads.
 ///
 /// Ordering rationale (AstroBWTv3 is memory/cache-heavy: suffix-array build,
 /// RC4 in-place, 278-iter branch loop with CodeLUT):
 ///
-///   1. P-core distinct physicals first (even logicals 0,2,4,6,8,10,12,14):
-///      each occupies its own physical core → no L1/L2 sharing = full cache per thread.
-///   2. E-cores (16..23): have their own L2 but smaller; still beat HT siblings.
-///   3. P-core HT siblings (odd logicals 1,3,5,7,9,11,13,15): share L1/L2 with
-///      the already-scheduled partner; worst cache locality for this workload.
+///   1. One thread per distinct physical core first: each occupies its own
+///      physical core → no L1/L2 sharing = full cache per thread.
+///   2. Remaining SMT siblings last: they share L1/L2 with the core's first
+///      thread; worst cache locality for this workload.
 ///
-/// For 10 threads on i7-13700HX our recommendation is:
-///   logical [0,2,4,6,8,10,12,14,16,17] — 8 distinct P-cores + 2 E-cores.
-/// This gives 10 independent cache domains (8 P-core L2s + shared E-cluster L2).
-/// Prefer this over 8P+2HT-siblings because sibling pairs share 2MB L2 and will
-/// thrash each other on the 278-iter CodeLUT loop (~5KB hot data per thread).
+/// Windows: derived from a fixed layout (i7-13700HX: P-core even logicals
+/// 0..14, then E-cores 16..23, then P-core HT siblings 1..15) because the
+/// current build has no portable topology API.
 ///
-/// The lead should A/B test this against all-E-core-excluded and all-HT configs.
+/// Linux: discovered from sysfs (/sys/devices/system/cpu/cpuN/topology/
+/// thread_siblings_list), filtered to the process's allowed set
+/// (sched_getaffinity), so it adapts to AMD Zen4/Zen5, Intel hybrid, and
+/// cgroup-restricted environments. Falls back to an SMT-pair assumption
+/// (evens first) if sysfs is unreadable.
 ///
-/// Returns up to 24 entries; entries beyond n are 0-filled.
-pub fn recommendedAffinityForThreads(n: usize) [24]u6 {
-    // Ordered preference: distinct P-core physicals, then E-cores, then HT siblings.
-    const order = [24]u6{
-        // 8 distinct P-core physical cores (even logicals = first HT sibling)
-        0,  2,  4,  6,  8,  10, 12, 14,
-        // 8 E-cores (no HT)
-        16, 17, 18, 19, 20, 21, 22, 23,
-        // 8 P-core HT siblings (share L1/L2 with their even partner above)
-        1,  3,  5,  7,  9,  11, 13, 15,
-    };
+/// Returns up to MAX_AFFINITY entries; entries beyond n are 0-filled.
+pub fn recommendedAffinityForThreads(n: usize) [MAX_AFFINITY]u7 {
+    var result = [_]u7{0} ** MAX_AFFINITY;
+    const count = @min(n, MAX_AFFINITY);
 
-    var result = [_]u6{0} ** 24;
-    const count = @min(n, 24);
-    for (0..count) |i| {
-        result[i] = order[i];
+    if (comptime builtin.os.tag == .windows) {
+        // Fixed i7-13700HX layout: 8 distinct P-core physicals, 8 E-cores, 8 HT siblings.
+        const order = [_]u7{
+            0,  2,  4,  6,  8,  10, 12, 14, // 8 distinct P-core physicals
+            16, 17, 18, 19, 20, 21, 22, 23, // 8 E-cores (no HT)
+            1,  3,  5,  7,  9,  11, 13, 15, // 8 P-core HT siblings
+        };
+        for (0..@min(count, order.len)) |i| result[i] = order[i];
+    } else if (comptime builtin.os.tag == .linux) {
+        linuxAffinityOrder(&result, count);
+    } else {
+        for (0..count) |i| result[i] = @intCast(i);
     }
     return result;
+}
+
+/// Linux: fill `result` with `count` logical CPUs ordered one-per-physical-core
+/// first, SMT siblings last. Respects the process's allowed affinity mask.
+fn linuxAffinityOrder(result: *[MAX_AFFINITY]u7, count: usize) void {
+    var allowed: std.os.linux.cpu_set_t = @splat(0);
+    _ = std.os.linux.sched_getaffinity(0, @sizeOf(std.os.linux.cpu_set_t), &allowed);
+
+    const allowedCpu = struct {
+        fn f(set: std.os.linux.cpu_set_t, cpu: usize) bool {
+            if (cpu >= std.os.linux.CPU_SETSIZE) return false;
+            const w = cpu / @bitSizeOf(usize);
+            const bit: u6 = @intCast(cpu % @bitSizeOf(usize));
+            return (set[w] & (@as(usize, 1) << bit)) != 0;
+        }
+    }.f;
+
+    // Group representative per cpu (lowest sibling in its core), from sysfs.
+    var rep = [_]u8{0xff} ** MAX_AFFINITY; // 0xff = unknown
+    var have_sysfs = false;
+    for (0..MAX_AFFINITY) |cpu| {
+        var pbuf: [80]u8 = undefined;
+        const path = std.fmt.bufPrint(&pbuf, "/sys/devices/system/cpu/cpu{d}/topology/thread_siblings_list", .{cpu}) catch continue;
+        const f = std.fs.openFileAbsolute(path, .{}) catch continue;
+        defer f.close();
+        var buf: [64]u8 = undefined;
+        const rd = f.readAll(&buf) catch continue;
+        var lo: u8 = 0xff;
+        var it = std.mem.splitScalar(u8, std.mem.trim(u8, buf[0..rd], " \n"), ',');
+        while (it.next()) |tok| {
+            if (tok.len == 0) continue;
+            if (std.mem.indexOfScalar(u8, tok, '-')) |dash| {
+                const a = std.fmt.parseInt(u8, tok[0..dash], 10) catch continue;
+                const b = std.fmt.parseInt(u8, tok[dash + 1 ..], 10) catch continue;
+                const m = @min(a, b);
+                if (lo == 0xff or m < lo) lo = m;
+            } else {
+                const a = std.fmt.parseInt(u8, tok, 10) catch continue;
+                if (lo == 0xff or a < lo) lo = a;
+            }
+        }
+        if (lo != 0xff) {
+            rep[cpu] = lo;
+            have_sysfs = true;
+        }
+    }
+
+    // Ordered output: pass 1 = each allowed representative (ascending, which is
+    // also ascending-by-core since reps are core minima); pass 2 = other siblings.
+    var out: [MAX_AFFINITY]u7 = undefined;
+    var olen: usize = 0;
+
+    if (have_sysfs) {
+        // A cpu whose siblings file failed to read keeps rep 0xff; treat it as a
+        // representative so it lands in the physical-core wave, not after all
+        // real siblings.
+        for (0..MAX_AFFINITY) |cpu| {
+            if (!allowedCpu(allowed, cpu)) continue;
+            if (rep[cpu] == cpu or rep[cpu] == 0xff) {
+                out[olen] = @intCast(cpu);
+                olen += 1;
+            }
+        }
+        for (0..MAX_AFFINITY) |cpu| {
+            if (!allowedCpu(allowed, cpu)) continue;
+            if (rep[cpu] != cpu and rep[cpu] != 0xff) {
+                out[olen] = @intCast(cpu);
+                olen += 1;
+            }
+        }
+    } else {
+        // Fallback: assume SMT pairs (2i, 2i+1): evens first, then odds.
+        for (0..MAX_AFFINITY) |cpu| {
+            if (!allowedCpu(allowed, cpu)) continue;
+            if (cpu % 2 == 0) {
+                out[olen] = @intCast(cpu);
+                olen += 1;
+            }
+        }
+        for (0..MAX_AFFINITY) |cpu| {
+            if (!allowedCpu(allowed, cpu)) continue;
+            if (cpu % 2 == 1) {
+                out[olen] = @intCast(cpu);
+                olen += 1;
+            }
+        }
+    }
+
+    const take = @min(count, olen);
+    for (0..take) |i| result[i] = out[i];
+    if (olen == 0) {
+        // sched_getaffinity failed (allowed came back all zeros) or every cpu was
+        // filtered out. Never return an all-zero map: that would pin every thread
+        // to cpu 0. Fall back to plain ascending cpus; pins to any cpu that is
+        // genuinely disallowed fail silently, leaving that thread unpinned.
+        for (0..@min(count, MAX_AFFINITY)) |i| result[i] = @intCast(i);
+    }
 }
 
 // ── internal helpers ──────────────────────────────────────────────────────────
@@ -324,13 +457,26 @@ test "roundUp" {
 
 test "recommendedAffinityForThreads ordering" {
     const map = recommendedAffinityForThreads(10);
-    // First 8 should be distinct P-core physicals
-    try std.testing.expectEqual(@as(u6, 0), map[0]);
-    try std.testing.expectEqual(@as(u6, 2), map[1]);
-    try std.testing.expectEqual(@as(u6, 14), map[7]);
-    // 9th+10th should be first two E-cores
-    try std.testing.expectEqual(@as(u6, 16), map[8]);
-    try std.testing.expectEqual(@as(u6, 17), map[9]);
-    // Beyond n should be zero
-    try std.testing.expectEqual(@as(u6, 0), map[10]);
+    if (builtin.os.tag == .windows) {
+        // Fixed i7-13700HX layout: 8 distinct P-core physicals, then 2 E-cores.
+        try std.testing.expectEqual(@as(u7, 0), map[0]);
+        try std.testing.expectEqual(@as(u7, 2), map[1]);
+        try std.testing.expectEqual(@as(u7, 14), map[7]);
+        try std.testing.expectEqual(@as(u7, 16), map[8]);
+        try std.testing.expectEqual(@as(u7, 17), map[9]);
+    } else if (builtin.os.tag == .linux) {
+        // Topology-aware: the map must never contain a cpu twice (machine-
+        // independent property). Ascending order can't be asserted here because
+        // on machines with fewer physical cores than requested threads the
+        // SMT siblings legitimately follow physicals (e.g. 0,2,4,6,1,3,... on a
+        // 4-core box), which is not strictly ascending.
+        try std.testing.expectEqual(@as(u7, 0), map[0]);
+        var seen = [_]bool{false} ** MAX_AFFINITY;
+        for (0..10) |i| {
+            try std.testing.expect(!seen[map[i]]);
+            seen[map[i]] = true;
+        }
+    }
+    // Beyond n should be zero on every OS
+    try std.testing.expectEqual(@as(u7, 0), map[10]);
 }
