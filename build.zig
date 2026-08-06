@@ -89,9 +89,14 @@ fn addArmSha(
 
 pub fn build(b: *std.Build) void {
     // Default to the best-performance configuration so a bare `zig build` (no flags)
-    // produces the fastest binary: ReleaseFast, the x86_64_v3+sha baseline on x86_64
-    // hosts (the legacy-SSE SHA path that beats `native`), and PGO when a local profile
-    // exists. All overridable via -Doptimize / -Dtarget / -Dcpu / -Dpgo.
+    // produces the fastest binary for the BUILD HOST: ReleaseFast, the host's native
+    // CPU on x86_64 (so AVX-512 hosts automatically get the gated 64-byte AVX-512
+    // suffix-array kernels in src/sa_v114_pure.zig -- measured +5.9% on Zen5 vs the
+    // x86_64_v3+sha baseline), and PGO when a local profile exists. A native binary
+    // only runs on the build host (or a compatible CPU), so portable/release builds
+    // pin a baseline explicitly: -Dcpu=x86_64_v3+sha (AVX2+SHA-NI), -Dtarget=...,
+    // exactly as scripts/release.sh and CI do. All overridable via -Doptimize /
+    // -Dtarget / -Dcpu / -Dpgo.
     const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Optimization mode (default: ReleaseFast)") orelse .ReleaseFast;
     const version = b.option([]const u8, "version", "Version embedded in zig-miner (release builds set this from the tag)") orelse "dev";
     const build_options = b.addOptions();
@@ -100,8 +105,7 @@ pub fn build(b: *std.Build) void {
     var default_query: std.Target.Query = .{};
     if (builtin.target.cpu.arch == .x86_64) default_query = .{
         .cpu_arch = .x86_64,
-        .cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64_v3 },
-        .cpu_features_add = std.Target.x86.featureSet(&.{.sha}),
+        .cpu_model = .{ .native = {} },
     };
     const target = b.standardTargetOptions(.{ .default_target = default_query });
 
