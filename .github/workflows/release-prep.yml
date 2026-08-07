@@ -1,0 +1,159 @@
+name: Release Prep
+
+# Opens the version-bump PR that a release needs, so cutting one is a merge plus
+# a single signed tag rather than hand-editing two files and remembering which.
+#
+# It deliberately stops short of tagging. scripts/release.sh publishes only from
+# an annotated tag whose signature GitHub reports as verified, and that key
+# belongs to a person, not to CI. Automating the bump removes the toil; the
+# signature stays the thing that says a human authorized this binary.
+#
+# Flow:
+#   merge work to main  ->  this opens "release: X.Y.Z"
+#   merge that PR       ->  bash scripts/tag-release.sh   (signs and pushes)
+#   tag lands           ->  Release workflow builds and publishes
+#
+# NOTE: a PR opened with GITHUB_TOKEN does not trigger other workflows -- GitHub
+# suppresses that to stop workflows retriggering each other. So the bump PR shows
+# no checks. That is tolerable here and nowhere else: it changes two version
+# strings, main was already green when the work merged, and the Release workflow
+# re-runs the full test suite against the tag before anything is published. If
+# you want checks on it anyway, close and reopen the PR.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to prepare (bare, e.g. 0.4.0). Blank = infer from commits."
+        default: ""
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare release bump
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Work out whether a release is due, and which
+        id: plan
+        run: |
+          set -euo pipefail
+
+          ZON="$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' build.zig.zon)"
+          LAST_TAG="$(git tag -l 'v*' --sort=-v:refname | head -1)"
+          LAST_VER="${LAST_TAG#v}"
+
+          # A bump already merged but not yet tagged: the tag step is the human's
+          # and may simply not have happened yet. Never stack a second bump on it.
+          if [ -n "$LAST_VER" ] && [ "$ZON" != "$LAST_VER" ]; then
+            echo "build.zig.zon is $ZON but the newest tag is $LAST_TAG -- $ZON is"
+            echo "prepared and waiting to be tagged. Nothing to do."
+            echo "due=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          RANGE="${LAST_TAG:+$LAST_TAG..}HEAD"
+          SUBJECTS="$(git log --no-merges --format=%s "$RANGE")"
+          if [ -z "$SUBJECTS" ]; then
+            echo "No commits since $LAST_TAG. Nothing to release."
+            echo "due=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # A release that only renumbers itself is not a release.
+          if ! grep -qvE '^(release|chore|docs|ci):' <<<"$SUBJECTS"; then
+            echo "Only release/chore/docs/ci commits since $LAST_TAG. Nothing to release."
+            echo "due=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          NEXT="${{ inputs.version }}"
+          if [ -z "$NEXT" ]; then
+            IFS=. read -r MAJ MIN PAT <<<"$ZON"
+            # feat -> minor, anything else -> patch. Majors are a judgement call,
+            # so they are never inferred: pass one via workflow_dispatch.
+            if grep -qE '^feat(\(|:)' <<<"$SUBJECTS"; then
+              NEXT="$MAJ.$((MIN + 1)).0"
+            else
+              NEXT="$MAJ.$MIN.$((PAT + 1))"
+            fi
+          fi
+
+          if git rev-parse "v$NEXT" >/dev/null 2>&1; then
+            echo "error: tag v$NEXT already exists" >&2
+            exit 1
+          fi
+
+          echo "Preparing $ZON -> $NEXT"
+          echo "due=true" >> "$GITHUB_OUTPUT"
+          echo "next=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "last_tag=$LAST_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Bump the version files and open the PR
+        if: steps.plan.outputs.due == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT: ${{ steps.plan.outputs.next }}
+          LAST_TAG: ${{ steps.plan.outputs.last_tag }}
+        run: |
+          set -euo pipefail
+          BRANCH="release/v$NEXT"
+
+          # Both files, because scripts/release.sh refuses to build unless the tag,
+          # build.zig.zon and the Hive manifest all agree.
+          sed -i "s/^\(    \.version = \"\)[^\"]*\(\",\)$/\1$NEXT\2/" build.zig.zon
+          sed -i "s/^CUSTOM_VERSION=.*/CUSTOM_VERSION=$NEXT/" config/h-manifest.conf
+          test "$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' build.zig.zon)" = "$NEXT"
+          test "$(sed -n 's/^CUSTOM_VERSION=//p' config/h-manifest.conf)" = "$NEXT"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git commit -qam "release: $NEXT"
+          git push -f origin "$BRANCH"
+
+          if gh pr view "$BRANCH" --json state --jq .state 2>/dev/null | grep -q OPEN; then
+            echo "PR for $BRANCH already open; pushed the refreshed bump to it."
+            exit 0
+          fi
+
+          {
+            echo "Version bump only -- no functional change."
+            echo
+            echo "\`scripts/release.sh\` refuses to build unless the tag, \`build.zig.zon\`"
+            echo "and the Hive manifest all agree, so the bump lands before the tag."
+            echo
+            echo "## Shipping in v$NEXT"
+            echo
+            git log --no-merges --format='- `%h` %s' "${LAST_TAG:+$LAST_TAG..}HEAD~1"
+            echo
+            echo "## After merging"
+            echo
+            echo '```'
+            echo "bash scripts/tag-release.sh"
+            echo '```'
+            echo
+            echo "That signs and pushes \`v$NEXT\`, which triggers the Release workflow."
+            echo "The signature is deliberately not automated: it is what records that a"
+            echo "human authorized this binary."
+            echo
+            echo "_Opened by the Release Prep workflow. It carries no checks because a PR"
+            echo "opened with \`GITHUB_TOKEN\` cannot trigger them; the Release workflow"
+            echo "re-runs the full suite against the tag before publishing._"
+          } > /tmp/pr-body.md
+
+          gh pr create --base main --head "$BRANCH" \
+            --title "release: $NEXT" --body-file /tmp/pr-body.md
