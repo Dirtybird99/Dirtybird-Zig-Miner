@@ -9,6 +9,32 @@ const astrobwt = @import("astrobwt.zig");
 const sa_fast = @import("sa_fast.zig");
 const sa_v114_pure = @import("sa_v114_pure.zig");
 const sha_mb = @import("sha256_mb.zig");
+const pages = @import("pages.zig");
+
+/// One descriptor-SA scratch per mining THREAD, shared by both lanes of `hash2`.
+///
+/// `hash2` runs `computeSA(in0, w0)` then `computeSA(in1, w1)` strictly
+/// sequentially, and `Scratch` carries nothing across a `buildSA` call: the
+/// Builder is constructed fresh with arena_len/runs_len/count at 0, `runs` is
+/// strict write-before-read, and `runs_tmp` is fully partitioned by the
+/// prefix-summed histogram before any pass reads it. (`arena` IS read past its
+/// written end by the unconditional wide copy in materialize, but that garbage
+/// only lands forward into a later bucket's territory and is overwritten in
+/// order, or past `n` where it is never hashed -- unchanged by sharing.)
+/// Reusing one Scratch across different inputs is already the shipped
+/// behaviour; `difftest` does it 2000 times.
+///
+/// Deliberately `threadlocal` rather than an alias between the two Workers'
+/// `sa_pure` fields: that would create a "both Workers must be same-thread"
+/// invariant enforced nowhere across five Worker construction sites, and
+/// violating it would be a silent data race producing wrong hashes. Threadlocal
+/// makes cross-thread sharing impossible by construction.
+///
+/// WHY: halves the per-thread hot working set (~1.84 MiB -> ~943 KB). Measured
+/// break point is between 12 and 16 threads, where all 8 E-cores come into play
+/// -- an E-cluster shares 4 MB of L2 across 4 cores, so 1.84 MiB/thread thrashes
+/// and 943 KB fits. Never freed: mining threads live for the process.
+threadlocal var tls_sa_pure: ?*sa_v114_pure.Scratch = null;
 
 // The profiler root opts in at compile time. Normal miner/bench roots do not
 // declare this flag, so every timer and counter below is dead-code eliminated.
@@ -83,8 +109,22 @@ pub fn computeSA(input: []const u8, w: *Worker) !void {
             // Pure-Zig clean-room descriptor SA (~2.4x libsais, no C/C++). Falls
             // back to the pure sa_fast bucket sort if the build declines (only on
             // degenerate n==0, which never occurs in mining).
-            if (w.sa_pure == null) w.sa_pure = std.heap.page_allocator.create(sa_v114_pure.Scratch) catch return error.OutOfMemory;
-            if (!sa_v114_pure.build(w.sa_pure.?, w.sData[0..].ptr, w.data_len, &w.template_markers, w.n_templates, w.sa[0..].ptr)) {
+            if (tls_sa_pure == null) {
+                // Prefer a large page. The touched part of Scratch spans ~145 4 KB
+                // pages against Gracemont's 48-entry L1 DTLB, so on the E-cores --
+                // where the 12->16 thread cliff lives -- the walk is re-done on
+                // every hash. `enableLockMemoryPrivilege()` runs in main before any
+                // mining thread spawns, so the privilege is already in effect here.
+                // Falls back to 4 KB pages when the privilege is absent or physical
+                // memory is too fragmented (GetLastError 1314 / 1450): the miner
+                // must still run on a machine that grants neither.
+                if (pages.allocHugeBacking(@sizeOf(sa_v114_pure.Scratch))) |backing| {
+                    tls_sa_pure = @ptrCast(@alignCast(backing.bytes.ptr));
+                } else {
+                    tls_sa_pure = std.heap.page_allocator.create(sa_v114_pure.Scratch) catch return error.OutOfMemory;
+                }
+            }
+            if (!sa_v114_pure.build(tls_sa_pure.?, w.sData[0..].ptr, w.data_len, &w.template_markers, w.n_templates, w.sa[0..].ptr)) {
                 if (w.sa_scratch == null) w.sa_scratch = std.heap.page_allocator.create(sa_fast.Scratch) catch return error.OutOfMemory;
                 sa_fast.bucketSortSA(w.sa_scratch.?, w.sData[0..w.data_len].ptr, w.sa[0..w.data_len].ptr, w.data_len);
             }

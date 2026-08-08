@@ -1104,6 +1104,37 @@ fn loadConfig(
     return true;
 }
 
+/// Worker count when `-t` is absent.
+///
+/// Taking every logical CPU starves the miner's own non-mining threads. Measured
+/// on an i7-13700HX (24 logical) with 120 s live runs, 180 s cooldowns:
+///
+///   -t 20  25.73 KH/s   reporter emitted 116 status lines / 120 s
+///   -t 22  26.60 KH/s   (+3.40%)   118 lines
+///   -t 24  26.99 KH/s   (+4.92%)    34 lines   <-- 3.4x collapse
+///
+/// At full occupancy the reporter and the NETWORK thread compete with 24 workers
+/// for 24 CPUs. Reporter starvation is directly observable; the network thread
+/// shares that contention, which risks delayed job pickup and therefore stale
+/// work. The 24-thread run found no shares in its window, so its raw +4.92% is
+/// not backed by any evidence about *effective* hashrate -- and raw hashrate on
+/// stale jobs is worth nothing.
+///
+/// So: reserve headroom rather than chase the raw number. Two logical CPUs once
+/// there are enough to spare, one on small hosts, all of them below that -- a
+/// 2-core box has no headroom to give and stalling it entirely is worse.
+///
+/// Note the competitor arrived at the same policy independently: AstroX caps its
+/// automatic count at 22 on this same 24-logical host ("capped at 22" in its own
+/// help text). Two implementations converging on "leave two" is decent evidence
+/// it is not arbitrary.
+fn autoThreadCount() usize {
+    const cpus = std.Thread.getCpuCount() catch return 4;
+    if (cpus >= 8) return cpus - 2;
+    if (cpus >= 4) return cpus - 1;
+    return cpus;
+}
+
 pub fn main() !u8 {
     // Keep the aarch64-linux TLS-alignment anchor from being stripped.
     if (bionic_tls_anchor_needed) asm volatile (""
@@ -1278,7 +1309,7 @@ pub fn main() !u8 {
 
     if (G.wallet.len == 0) return flagError("-w <wallet> is required", .{});
 
-    if (nthreads == 0) nthreads = std.Thread.getCpuCount() catch 4;
+    if (nthreads == 0) nthreads = autoThreadCount();
     G.nthreads = nthreads;
 
     if (builtin.os.tag == .windows) {

@@ -80,21 +80,19 @@ pub const Scratch = struct {
     arena: [SCRATCH]u32 = undefined, // every position, laid out run-by-run
     runs: [SCRATCH]Run = undefined, // worst case: `n` singleton runs
     runs_tmp: [SCRATCH]Run = undefined, // radix scratch for the run sort
-    tmp: [SCRATCH]u32 = undefined, // per-bucket merge buffer
 };
 
 /// 3-pass LSD byte radix sort of `runs` by the 24-bit key in the top field
 /// (ascending; stable, so equal-key runs keep emit order -- the payload bits
-/// below the key never influence the order). All three histograms come from a
-/// single fused counting pass, so the array is walked 4 times instead of 6.
-/// `tmp` must be at least runs.len long; result ends up back in `runs`.
-fn radixSortRuns(runs: []Run, tmp: []Run) void {
-    var count = [3][256]u32{ [_]u32{0} ** 256, [_]u32{0} ** 256, [_]u32{0} ** 256 };
-    for (runs) |r| {
-        count[0][(r >> RUN_KEY_SHIFT) & 0xff] += 1;
-        count[1][(r >> (RUN_KEY_SHIFT + 8)) & 0xff] += 1;
-        count[2][(r >> (RUN_KEY_SHIFT + 16)) & 0xff] += 1;
-    }
+/// below the key never influence the order). The three histograms are built by
+/// emit (see Builder.countKey) rather than by a counting pass here, so `runs`
+/// is walked 3 times instead of 4.
+/// `tmp` must be at least runs.len long. Returns whichever buffer the sorted
+/// result landed in -- an odd pass count leaves it in `tmp`, so copying it back
+/// into `runs` would cost a full extra read+write of the array (~636 KB/hash at
+/// 19.9k runs) for nothing. The caller reads the returned slice instead.
+fn radixSortRuns(runs: []Run, tmp: []Run, counts: *[3][256]u32) []Run {
+    var count = counts.*;
     for (&count) |*hist| {
         var sum: u32 = 0;
         for (hist) |*c| {
@@ -111,18 +109,52 @@ fn radixSortRuns(runs: []Run, tmp: []Run) void {
         // on the (dead) post-final-pass increment (40 -> 48 -> 56 -> 64).
         const shift: u6 = @intCast(RUN_KEY_SHIFT + 8 * pass);
         const hist = &count[pass];
-        for (src) |r| {
+        var i: usize = 0;
+        while (i + 4 <= src.len) : (i += 4) {
+            const r0 = src[i];
+            const r1 = src[i + 1];
+            const r2 = src[i + 2];
+            const r3 = src[i + 3];
+
+            const b0 = (r0 >> shift) & 0xff;
+            const b1 = (r1 >> shift) & 0xff;
+            const b2 = (r2 >> shift) & 0xff;
+            const b3 = (r3 >> shift) & 0xff;
+
+            const p0 = hist[b0]; hist[b0] += 1;
+            dst[p0] = r0;
+
+            const p1 = hist[b1]; hist[b1] += 1;
+            dst[p1] = r1;
+
+            const p2 = hist[b2]; hist[b2] += 1;
+            dst[p2] = r2;
+
+            const p3 = hist[b3]; hist[b3] += 1;
+            dst[p3] = r3;
+        }
+        while (i < src.len) : (i += 1) {
+            const r = src[i];
             const bkt = (r >> shift) & 0xff;
-            dst[hist[bkt]] = r;
+            const p = hist[bkt];
             hist[bkt] += 1;
+            dst[p] = r;
         }
         const t = src;
         src = dst;
         dst = t;
     }
-    // 3 passes (odd) leave the sorted result in `tmp`; copy back to `runs`.
-    if (src.ptr != runs.ptr) @memcpy(runs, src);
+    // `src` is the buffer the last pass wrote into. On runs.len == 0 the passes
+    // are no-ops but the swaps still run, so this is `tmp[0..0]` -- correct, and
+    // the caller's bucket walk never enters.
+    return src;
 }
+
+/// Width of the bucket prefix key, in bytes. Elements sharing a bucket agree on
+/// this many leading bytes, which is exactly what `lessAfterKey` may skip. It is
+/// not a free parameter: `load24`/`keyBE`/`radixSortRuns` and the 24-bit key field
+/// in `Run` all encode the same 3, so changing it here alone would be wrong.
+const KEY_BYTES: u32 = 3;
 
 /// Little-endian 3-byte load. Requires >=3 readable bytes at `pos` (the caller
 /// zero-pads >=3 bytes past the last suffix position). The padding value does
@@ -146,17 +178,28 @@ inline fn keyBE(k: u32) u32 {
 const SuffixCtx = struct {
     data: [*]const u8,
     n: u32,
-    fn less(ctx: SuffixCtx, a: u32, b: u32) bool {
+    /// `skip` bytes at the front are already known equal, so the scan starts there
+    /// instead of at 0. No `common <= skip` guard is needed: every loop below is
+    /// bounded by `common`, so when the shorter suffix is no longer than `skip` all
+    /// three fall through to the length tiebreak, which is the right answer. (The
+    /// C++ `compare_suffixes_after_key` spells that guard out explicitly; the loop
+    /// bounds here give the same result.) This matters because `load24` may read the
+    /// zero padding past `data_len`, so two positions near the end can share a
+    /// *padded* key without sharing three real bytes.
+    inline fn lessSkip(ctx: SuffixCtx, a: u32, b: u32, comptime skip: u32) bool {
         const alen = ctx.n - a;
         const blen = ctx.n - b;
         const common = @min(alen, blen);
-        var i: u32 = 0;
+        var i: u32 = skip;
         // 64 bytes at a time (AVX-512 only, see `wide_ok`): equal-compare the
         // lanes, jump to the first differing byte via a movemask +
         // count-trailing-zeros (one bit per byte). This lowers to a single
-        // vpcmpb + kmovq pair per 64 bytes. The Wolf-permuted data has a deep
-        // mean LCP (~68 bytes), so this loop is the whole cost of the pdq
-        // sorts in the emit/materialize phases.
+        // vpcmpb + kmovq pair per 64 bytes.
+        //
+        // The Wolf-permuted data has a mean LCP of ~68 bytes, but DO NOT read that
+        // as the length these compares run -- see the dead-end note below the
+        // block. `skip` already covers the shared key, and the surviving compare
+        // is far shorter than the global mean.
         if (comptime wide_ok) {
             while (i + 64 <= common) : (i += 64) {
                 const va: V64u8 = ctx.data[a + i ..][0..64].*;
@@ -164,22 +207,76 @@ const SuffixCtx = struct {
                 const eqbits: u64 = @bitCast(va == vb);
                 if (eqbits != 0xFFFF_FFFF_FFFF_FFFF) {
                     const off: u32 = @ctz(~eqbits);
+                    if (comptime INSTRUMENT) noteCmp(i + off - skip);
                     return ctx.data[a + i + off] < ctx.data[b + i + off];
                 }
             }
         }
+        // NO 32-BYTE AVX2 PATH HERE, AND THAT IS DELIBERATE. Adding one looks
+        // obvious -- this host has AVX2, `wide_ok` is false because Raptor Lake
+        // fuses off AVX-512, so the comparator "drops to" the 8-byte scalar loop
+        // below. MEASURED 2026-08-07: a 32-byte @Vector(32,u8) compare here cost
+        // -2.03% at 20 threads (0/8 paired runs won). The optimize-loop had
+        // already recorded the same sign at iteration 2 ("SIMD 32B prefix scan in
+        // SuffixCtx.less - 12.2pct worse, compares diverge early").
+        //
+        // WHY: the global mean LCP is ~68 bytes, but that is NOT the length these
+        // compares run. Measured with the compare-length histogram in prof.zig
+        // (n = 354M comparisons) -- bytes scanned past `skip` before resolving:
+        //      0-7  61.27%    8-15  19.60%   16-23  6.79%
+        //     24-31  1.16%   32-63   2.06%     64+  9.12%
+        // 61% resolve inside the FIRST 8-byte load and 88.8% inside 32 bytes, so a
+        // 32-byte step pays vector setup on every comparison to help only 11.2%.
+        //
+        // REGIME-DEPENDENT, and that is the trap. At 1 thread the wide load is
+        // nearly free and the 9.12% long tail pays for it: AVX2 measured +1.08%
+        // (p95bench aggregate, 3/4) and +1.17% (bench2, 6/6). At the 20-22 thread
+        // operating point it LOSES -- the extra bytes touched cost more in
+        // E-cluster L2 contention than the saved iterations. Screen this at 20T+
+        // or it will look like a win.
+        //
+        // THE GATED HYBRID WAS ALSO TRIED AND IS ALSO A NULL. Escalating to the
+        // 32-byte step only after 16 scalar bytes -- chosen because 80.9% resolve
+        // inside 16, and 58.5% of the survivors then run past 32 -- measured
+        // median +0.04% at 22 threads (4/7 pairs, one pair discarded as
+        // contaminated) and, at 1 thread, +0.37% on bench2 against +0.45% SLOWER
+        // on p95bench aggregate. Both regimes sit under the harness's ~0.5%
+        // resolution and the two 1T harnesses disagree in sign. The gate works --
+        // it removes the -2.03% penalty of the unconditional path -- but it also
+        // gates away the gain: only 19.1% of comparisons ever reach the vector
+        // loop. Not merged; a second comparator path is not worth zero.
         // 8-byte tail: big-endian load makes the u64 compare a lexicographic compare.
         while (i + 8 <= common) : (i += 8) {
             const av = std.mem.readInt(u64, ctx.data[a + i ..][0..8], .big);
             const bv = std.mem.readInt(u64, ctx.data[b + i ..][0..8], .big);
-            if (av != bv) return av < bv;
+            if (av != bv) {
+                if (comptime INSTRUMENT) noteCmp(i - skip + (@clz(av ^ bv) >> 3));
+                return av < bv;
+            }
         }
         while (i < common) : (i += 1) {
             const av = ctx.data[a + i];
             const bv = ctx.data[b + i];
-            if (av != bv) return av < bv;
+            if (av != bv) {
+                if (comptime INSTRUMENT) noteCmp(i - skip);
+                return av < bv;
+            }
         }
+        if (comptime INSTRUMENT) noteCmp(i - skip);
         return alen < blen;
+    }
+
+    /// No prefix known equal -- the rel=255 seed sort.
+    fn less(ctx: SuffixCtx, a: u32, b: u32) bool {
+        return lessSkip(ctx, a, b, 0);
+    }
+
+    /// Multi-run bucket: every element shares the bucket's 3-byte prefix key by
+    /// construction, so the first three bytes are already resolved. Mirrors the C++
+    /// `compare_suffixes_after_key` (vendor/v114/v114_stubs.cpp), which the pure-Zig
+    /// port had collapsed back into a from-zero compare.
+    fn lessAfterKey(ctx: SuffixCtx, a: u32, b: u32) bool {
+        return lessSkip(ctx, a, b, KEY_BYTES);
     }
 };
 
@@ -195,6 +292,42 @@ pub var stat_single_pos: u32 = 0; // positions copied directly (single-run bucke
 pub var ns_emit: u64 = 0;
 pub var ns_sort: u64 = 0;
 pub var ns_mat: u64 = 0;
+// Time spent inside the multi-run bucket re-sort alone, a subset of ns_mat. This
+// is the only work a suffix-comparator change can reach, so it is the ceiling for
+// any such change; the rest of ns_mat is single-run wide copies.
+pub var ns_msort: u64 = 0;
+// stat_* describe the LAST hash only -- they are reset per buildSA call, not
+// accumulated. ns_* accumulate.
+pub var acc_multi_pos: u64 = 0;
+pub var acc_single_pos: u64 = 0;
+// Multi-run buckets and the runs inside them. m/bucket sets how much a k-way merge
+// of the (already sorted) runs could save over re-sorting the concatenation.
+pub var acc_multi_buckets: u64 = 0;
+pub var acc_multi_runs: u64 = 0;
+/// Single-run bucket length distribution. The materialize copy width is only
+/// worth narrowing if most runs fit inside the narrow store.
+/// Bytes scanned past `skip` before a suffix comparison resolves, bucketed
+/// 0-7 / 8-15 / 16-23 / 24-31 / 32-63 / 64+. Bucket 0 is the population a
+/// 32-byte vector step could never help: it resolves inside one 8-byte load.
+pub var cmp_hist: [6]u64 = .{0} ** 6;
+pub var cmp_total: u64 = 0;
+
+inline fn noteCmp(bytes: u32) void {
+    cmp_total += 1;
+    const b: usize = if (bytes < 8) 0 else if (bytes < 16) 1 else if (bytes < 24) 2 else if (bytes < 32) 3 else if (bytes < 64) 4 else 5;
+    cmp_hist[b] += 1;
+}
+
+pub var acc_rl_le4: u64 = 0;
+pub var acc_rl_5to8: u64 = 0;
+pub var acc_rl_gt8: u64 = 0;
+// Work units inside the emit phase, counted rather than timed: a timer around a
+// loop entered 256x per group-run would cost more than the loop. `emit_key_loads`
+// counts load24 calls in run formation; `emit_shifts` counts element moves in the
+// per-rel single-byte insertion. Their ratio says which half of emit to attack.
+pub var emit_key_loads: u64 = 0;
+pub var emit_shifts: u64 = 0;
+pub var emit_seed_elems: u64 = 0;
 
 const Builder = struct {
     sc: *Scratch,
@@ -202,17 +335,32 @@ const Builder = struct {
     ctx: SuffixCtx,
     arena_len: u32 = 0,
     runs_len: u32 = 0,
+    /// Radix histograms for the three key bytes, accumulated here instead of in
+    /// a separate counting pass over `runs`. Emit already holds the key in a
+    /// register when it packs the Run, so the three increments are free here,
+    /// whereas the counting pass had to stream all of `runs` (159 KB at 19.9k
+    /// runs) back in from L2 before pass 0 streamed it in again.
+    count: [3][256]u32 = .{ [_]u32{0} ** 256, [_]u32{0} ** 256, [_]u32{0} ** 256 },
+
+    /// Fold one run's key into the histograms. `key` is the big-endian 3-byte
+    /// prefix and MUST be < 2^24: the three passes read bytes 0..2 of it, so a
+    /// wider key would desync the prefix sums from the scatter and corrupt the
+    /// SA silently.
+    inline fn countKey(self: *Builder, key: u32) void {
+        std.debug.assert(key < (1 << 24));
+        self.count[0][key & 0xff] += 1;
+        self.count[1][(key >> 8) & 0xff] += 1;
+        self.count[2][(key >> 16) & 0xff] += 1;
+    }
 
     /// Record a run of already-suffix-sorted positions sharing one 3-byte prefix.
     inline fn appendRun(self: *Builder, positions: []const u32) void {
         const begin = self.arena_len;
         @memcpy(self.sc.arena[begin .. begin + positions.len], positions);
         self.arena_len = begin + @as(u32, @intCast(positions.len));
-        self.sc.runs[self.runs_len] = packRun(
-            keyBE(load24(self.data, positions[0])),
-            begin,
-            @intCast(positions.len),
-        );
+        const key = keyBE(load24(self.data, positions[0]));
+        self.countKey(key);
+        self.sc.runs[self.runs_len] = packRun(key, begin, @intCast(positions.len));
         self.runs_len += 1;
     }
 
@@ -224,7 +372,9 @@ const Builder = struct {
             const pos = start + rel;
             const begin = self.arena_len;
             self.sc.arena[begin] = pos;
-            self.sc.runs[self.runs_len] = packRun(keyBE(load24(self.data, pos)), begin, 1);
+            const key = keyBE(load24(self.data, pos));
+            self.countKey(key);
+            self.sc.runs[self.runs_len] = packRun(key, begin, 1);
             self.arena_len = begin + 1;
             self.runs_len += 1;
         }
@@ -243,6 +393,7 @@ const Builder = struct {
         // rel = 255: the G same-offset suffixes, sorted once by full suffix.
         var c: u32 = 0;
         while (c < g) : (c += 1) order[c] = base + (c << 8) + 255;
+        if (comptime INSTRUMENT) emit_seed_elems += g;
         std.sort.pdq(u32, order[0..g], self.ctx, SuffixCtx.less);
 
         var rel: i32 = 255;
@@ -253,6 +404,7 @@ const Builder = struct {
                 const key = load24(self.data, order[i]);
                 var j = i + 1;
                 while (j < g and load24(self.data, order[j]) == key) : (j += 1) {}
+                if (comptime INSTRUMENT) emit_key_loads += (j - i) + 1;
                 self.appendRun(order[i..j]);
                 i = j;
             }
@@ -268,6 +420,7 @@ const Builder = struct {
                     var m = ii;
                     while (m > 0 and self.data[order[m - 1]] > k) : (m -= 1) {
                         order[m] = order[m - 1];
+                        if (comptime INSTRUMENT) emit_shifts += 1;
                     }
                     order[m] = pos;
                 }
@@ -304,7 +457,12 @@ pub fn buildSA(sc: *Scratch, data: [*]const u8, n: u32, flags: [*]const u8, sa_o
     if (INSTRUMENT) ns_emit += tmr.lap();
 
     // Global order by 3-byte prefix (O(runs) radix; dominated the profile as pdq).
-    radixSortRuns(sc.runs[0..b.runs_len], sc.runs_tmp[0..]);
+    // The sorted runs may land in either buffer -- read them through `sorted`.
+    const sorted = radixSortRuns(sc.runs[0..b.runs_len], sc.runs_tmp[0..], &b.count);
+    // 3 passes with a swap after each => the result is ALWAYS in runs_tmp. The
+    // in-place bucket sort below assumes `sc.runs` is dead from here on; if the
+    // pass count ever changes, this catches it instead of corrupting the SA.
+    std.debug.assert(b.runs_len == 0 or sorted.ptr == @as([*]Run, &sc.runs_tmp));
     if (INSTRUMENT) {
         ns_sort += tmr.lap();
         stat_runs = b.runs_len;
@@ -317,52 +475,79 @@ pub fn buildSA(sc: *Scratch, data: [*]const u8, n: u32, flags: [*]const u8, sa_o
     var out_pos: u32 = 0;
     var i: u32 = 0;
     while (i < b.runs_len) {
-        const key_i = sc.runs[i] >> RUN_KEY_SHIFT;
+        // Hold the run in a register across the bucket-boundary scan: the
+        // single-run branch below used to re-load sorted[i] that this line
+        // already fetched.
+        const r_i = sorted[i];
+        const key_i = r_i >> RUN_KEY_SHIFT;
         var j = i + 1;
-        while (j < b.runs_len and (sc.runs[j] >> RUN_KEY_SHIFT) == key_i) : (j += 1) {}
+        while (j < b.runs_len and (sorted[j] >> RUN_KEY_SHIFT) == key_i) : (j += 1) {}
         if (j == i + 1) {
-            const r = sc.runs[i];
+            const r = r_i;
             const rl = runLen(r);
             const rb = runBegin(r);
-            if (INSTRUMENT) stat_single_pos += rl;
+            if (INSTRUMENT) {
+                stat_single_pos += rl;
+                acc_single_pos += rl;
+            }
             // One unconditional wide copy covers rl <= copy_width (the common
             // case, avg run len ~3.5) with no data-dependent branch; out_pos
             // only advances by rl, so over-copied lanes are overwritten by the
             // next run -- except after the FINAL bucket, which leaves up to
             // copy_width-1 scratch lanes past sa_out[n-1] (hence the documented
             // tail-slack requirement; n <= 70911 < SCRATCH-copy_width).
+            if (comptime INSTRUMENT) {
+                if (rl <= 4) acc_rl_le4 += 1 else if (rl <= 8) acc_rl_5to8 += 1 else acc_rl_gt8 += 1;
+            }
             if (comptime wide_ok) {
                 const v: V16u32 = sc.arena[rb..][0..16].*;
                 @as([*]u32, @ptrCast(sa_out))[out_pos..][0..16].* = v;
+                var k: u32 = 16;
+                while (k < rl) : (k += 1) sa_out[out_pos + k] = @intCast(sc.arena[rb + k]);
             } else {
                 const v: @Vector(8, u32) = sc.arena[rb..][0..8].*;
                 @as([*]u32, @ptrCast(sa_out))[out_pos..][0..8].* = v;
+                var k: u32 = 8;
+                while (k < rl) : (k += 1) sa_out[out_pos + k] = @intCast(sc.arena[rb + k]);
             }
-            var k: u32 = if (comptime wide_ok) 16 else 8;
-            while (k < rl) : (k += 1) sa_out[out_pos + k] = @intCast(sc.arena[rb + k]);
             out_pos += rl;
         } else {
+            // Gather the bucket's runs straight into `sa_out` and sort them there,
+            // rather than staging through a separate scratch buffer and copying
+            // back. `sa_out` is [*]i32 and positions are u32 below 2^17, so the
+            // reinterpret is value-preserving and the later @intCast disappears.
+            // The over-copy bound is identical to the single-run path above, so
+            // the tail-slack requirement is unchanged.
+            const dst: [*]u32 = @ptrCast(sa_out);
             var m: u32 = 0;
             var t = i;
             while (t < j) : (t += 1) {
-                const r = sc.runs[t];
+                const r = sorted[t];
                 const rl = runLen(r);
                 const rb = runBegin(r);
                 if (comptime wide_ok) {
                     const v: V16u32 = sc.arena[rb..][0..16].*;
-                    sc.tmp[m..][0..16].* = v;
+                    dst[out_pos + m ..][0..16].* = v;
                 } else {
                     const v: @Vector(8, u32) = sc.arena[rb..][0..8].*;
-                    sc.tmp[m..][0..8].* = v;
+                    dst[out_pos + m ..][0..8].* = v;
                 }
                 var k: u32 = if (comptime wide_ok) 16 else 8;
-                while (k < rl) : (k += 1) sc.tmp[m + k] = sc.arena[rb + k];
+                while (k < rl) : (k += 1) dst[out_pos + m + k] = sc.arena[rb + k];
                 m += rl;
             }
-            std.sort.pdq(u32, sc.tmp[0..m], b.ctx, SuffixCtx.less);
-            if (INSTRUMENT) stat_multi_pos += m;
-            var k: u32 = 0;
-            while (k < m) : (k += 1) sa_out[out_pos + k] = @intCast(sc.tmp[k]);
+            const bucket = dst[out_pos..][0..m];
+            if (comptime INSTRUMENT) {
+                var st = std.time.Timer.start() catch unreachable;
+                std.sort.pdq(u32, bucket, b.ctx, SuffixCtx.lessAfterKey);
+                ns_msort += st.read();
+                stat_multi_pos += m;
+                acc_multi_pos += m;
+                acc_multi_buckets += 1;
+                acc_multi_runs += j - i;
+            } else {
+                std.sort.pdq(u32, bucket, b.ctx, SuffixCtx.lessAfterKey);
+            }
             out_pos += m;
         }
         i = j;

@@ -93,6 +93,15 @@ pub fn main() !void {
         var mismatches: u64 = 0;
         var h2_mismatches: u64 = 0;
 
+        // Previous input, kept so the hash2 cross-check can feed the two lanes
+        // DIFFERENT messages and compare each against its own verified digest.
+        var prev_in: [128]u8 = undefined;
+        var prev_len: usize = 0;
+        var prev_out: [32]u8 = undefined;
+        var prev_hex: [256]u8 = undefined;
+        var prev_hex_len: usize = 0;
+        var have_prev = false;
+
         while (in_lines.next()) |raw_in| {
             const in_hex = std.mem.trim(u8, raw_in, " \r");
             if (in_hex.len == 0) continue;
@@ -122,15 +131,31 @@ pub fn main() !void {
                 }
             }
 
-            // Production-path cross-check: hash2(in, in) must equal the single hash
-            // in both lanes (same computeSA; only the multi-buffer SHA differs).
-            var o0: [32]u8 = undefined;
-            var o1: [32]u8 = undefined;
-            try pow.hash2(inbuf[0..in_len], inbuf[0..in_len], &o0, &o1, worker, worker1);
-            if (!std.mem.eql(u8, &o0, &out) or !std.mem.eql(u8, &o1, &out)) {
-                h2_mismatches += 1;
-                if (h2_mismatches <= 3) std.debug.print("HASH2 MISMATCH #{d} input={s}\n", .{ checked, in_hex });
+            // Production-path cross-check with DISTINCT inputs per lane.
+            //
+            // This used to be hash2(in, in) -- the same buffer in both lanes. That
+            // form cannot detect cross-lane contamination: if lane 1 read state
+            // left behind by lane 0, the state would be byte-identical to what
+            // lane 1 computes for itself, so the check passes for a reason
+            // unrelated to what it appears to test. Pairing each input with the
+            // previous one, and comparing each lane against that input's own
+            // already-verified single-hash result, closes that hole.
+            if (have_prev) {
+                var o0: [32]u8 = undefined;
+                var o1: [32]u8 = undefined;
+                try pow.hash2(prev_in[0..prev_len], inbuf[0..in_len], &o0, &o1, worker, worker1);
+                if (!std.mem.eql(u8, &o0, &prev_out) or !std.mem.eql(u8, &o1, &out)) {
+                    h2_mismatches += 1;
+                    if (h2_mismatches <= 3)
+                        std.debug.print("HASH2 MISMATCH #{d} lane0={s} lane1={s}\n", .{ checked, prev_hex[0..prev_hex_len], in_hex });
+                }
             }
+            @memcpy(prev_in[0..in_len], inbuf[0..in_len]);
+            prev_len = in_len;
+            prev_out = out;
+            prev_hex_len = @min(in_hex.len, prev_hex.len);
+            @memcpy(prev_hex[0..prev_hex_len], in_hex[0..prev_hex_len]);
+            have_prev = true;
             checked += 1;
         }
 

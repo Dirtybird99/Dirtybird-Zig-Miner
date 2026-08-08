@@ -76,6 +76,17 @@ pub fn main() !void {
     sa_pure.ns_emit = 0;
     sa_pure.ns_sort = 0;
     sa_pure.ns_mat = 0;
+    sa_pure.ns_msort = 0;
+    sa_pure.acc_multi_pos = 0;
+    sa_pure.acc_single_pos = 0;
+    sa_pure.acc_multi_buckets = 0;
+    sa_pure.acc_multi_runs = 0;
+    sa_pure.emit_key_loads = 0;
+    sa_pure.emit_shifts = 0;
+    sa_pure.emit_seed_elems = 0;
+    sa_pure.acc_rl_le4 = 0;
+    sa_pure.acc_rl_5to8 = 0;
+    sa_pure.acc_rl_gt8 = 0;
 
     var total_timer = try std.time.Timer.start();
     var rep: usize = 0;
@@ -117,6 +128,44 @@ pub fn main() !void {
         @as(f64, @floatFromInt(accounted_ns)) / total_f * 100.0,
         @as(f64, @floatFromInt(sum_data_len)) / (2.0 * @as(f64, @floatFromInt(pairs))),
         checksum,
+    });
+
+    // Split of the materialize phase. Positions landing in a multi-run bucket are
+    // re-sorted by full suffix compare; the rest are copied straight out. Only the
+    // multi share is reachable by a suffix-comparator change, and `multi re-sort` is
+    // that work timed on its own -- the hard ceiling for any comparator optimization.
+    {
+        const multi: f64 = @floatFromInt(sa_pure.acc_multi_pos);
+        const single: f64 = @floatFromInt(sa_pure.acc_single_pos);
+        const pos = multi + single;
+        row.print("  of which: multi re-sort", sa_pure.ns_msort, hashes, total_f);
+        std.debug.print("  materialize positions: multi={d:.2}% single={d:.2}%  pos/hash={d:.0}  runs/hash(last)={d}\n", .{
+            if (pos > 0) multi / pos * 100.0 else 0.0,
+            if (pos > 0) single / pos * 100.0 else 0.0,
+            pos / hashes,
+            sa_pure.stat_runs,
+        });
+        const bkt: f64 = @floatFromInt(sa_pure.acc_multi_buckets);
+        if (bkt > 0) std.debug.print("  multi buckets/hash={d:.0}  avg m/bucket={d:.2}  avg runs/bucket={d:.2}\n", .{
+            bkt / hashes,
+            multi / bkt,
+            @as(f64, @floatFromInt(sa_pure.acc_multi_runs)) / bkt,
+        });
+    }
+
+    {
+        const a4: f64 = @floatFromInt(sa_pure.acc_rl_le4);
+        const a8: f64 = @floatFromInt(sa_pure.acc_rl_5to8);
+        const ag: f64 = @floatFromInt(sa_pure.acc_rl_gt8);
+        const tot = a4 + a8 + ag;
+        if (tot > 0) std.debug.print("  single-run lengths: rl<=4 {d:.1}%  5..8 {d:.1}%  >8 {d:.1}%\n", .{
+            a4 / tot * 100.0, a8 / tot * 100.0, ag / tot * 100.0,
+        });
+    }
+    std.debug.print("  emit work/hash: key_loads={d:.0}  insertion_shifts={d:.0}  seed_sort_elems={d:.0}\n", .{
+        @as(f64, @floatFromInt(sa_pure.emit_key_loads)) / hashes,
+        @as(f64, @floatFromInt(sa_pure.emit_shifts)) / hashes,
+        @as(f64, @floatFromInt(sa_pure.emit_seed_elems)) / hashes,
     });
 
     if (comptime !astrobwt.profile_cycles_supported) {
@@ -186,6 +235,29 @@ pub fn main() !void {
     printCycleRow("unattributed", unattributed, wolf_hashes, cycles_per_ns);
     printCycleRow("TOTAL wolfCompute", total_mean, wolf_hashes, cycles_per_ns);
     if (clamped) std.debug.print("    note: a bucket fell below its calibrated probe cost and was clamped to zero\n", .{});
+    // Suffix-compare length distribution -- the premise behind every "use a
+    // wider comparator" proposal. Bucket 0 resolves inside one 8-byte load.
+    {
+        const h = sa_pure.cmp_hist;
+        const tot = sa_pure.cmp_total;
+        if (tot > 0) {
+            const cmp_names = [_][]const u8{ "0-7", "8-15", "16-23", "24-31", "32-63", "64+" };
+            std.debug.print("\ncompare length (bytes scanned past skip), n={d}\n", .{tot});
+            var cum: u64 = 0;
+            for (cmp_names, 0..) |nm, k| {
+                cum += h[k];
+                std.debug.print("  {s:>6}: {d:>12}  {d:>6.2}%  (cum {d:>6.2}%)\n", .{
+                    nm, h[k],
+                    @as(f64, @floatFromInt(h[k])) * 100.0 / @as(f64, @floatFromInt(tot)),
+                    @as(f64, @floatFromInt(cum)) * 100.0 / @as(f64, @floatFromInt(tot)),
+                });
+            }
+            std.debug.print("  >= 32 bytes (the only population a 32B step can help): {d:.2}%\n", .{
+                @as(f64, @floatFromInt(h[4] + h[5])) * 100.0 / @as(f64, @floatFromInt(tot)),
+            });
+        }
+    }
+
 }
 
 fn printCycleRow(name: []const u8, cycles: f64, n_hashes: f64, cycles_per_ns: f64) void {
