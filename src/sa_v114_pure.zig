@@ -121,16 +121,20 @@ fn radixSortRuns(runs: []Run, tmp: []Run, counts: *[3][256]u32) []Run {
             const b2 = (r2 >> shift) & 0xff;
             const b3 = (r3 >> shift) & 0xff;
 
-            const p0 = hist[b0]; hist[b0] += 1;
+            const p0 = hist[b0];
+            hist[b0] += 1;
             dst[p0] = r0;
 
-            const p1 = hist[b1]; hist[b1] += 1;
+            const p1 = hist[b1];
+            hist[b1] += 1;
             dst[p1] = r1;
 
-            const p2 = hist[b2]; hist[b2] += 1;
+            const p2 = hist[b2];
+            hist[b2] += 1;
             dst[p2] = r2;
 
-            const p3 = hist[b3]; hist[b3] += 1;
+            const p3 = hist[b3];
+            hist[b3] += 1;
             dst[p3] = r3;
         }
         while (i < src.len) : (i += 1) {

@@ -247,9 +247,8 @@ pub fn main() !void {
             for (cmp_names, 0..) |nm, k| {
                 cum += h[k];
                 std.debug.print("  {s:>6}: {d:>12}  {d:>6.2}%  (cum {d:>6.2}%)\n", .{
-                    nm, h[k],
-                    @as(f64, @floatFromInt(h[k])) * 100.0 / @as(f64, @floatFromInt(tot)),
-                    @as(f64, @floatFromInt(cum)) * 100.0 / @as(f64, @floatFromInt(tot)),
+                    nm,                                                                   h[k],
+                    @as(f64, @floatFromInt(h[k])) * 100.0 / @as(f64, @floatFromInt(tot)), @as(f64, @floatFromInt(cum)) * 100.0 / @as(f64, @floatFromInt(tot)),
                 });
             }
             std.debug.print("  >= 32 bytes (the only population a 32B step can help): {d:.2}%\n", .{
@@ -257,7 +256,6 @@ pub fn main() !void {
             });
         }
     }
-
 }
 
 fn printCycleRow(name: []const u8, cycles: f64, n_hashes: f64, cycles_per_ns: f64) void {
