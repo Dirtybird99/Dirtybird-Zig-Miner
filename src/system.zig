@@ -628,15 +628,46 @@ test "recommendedAffinityForThreads ordering" {
         // independent properties can be asserted. Ascending order is not one of
         // them: on a box with fewer physical cores than requested threads the SMT
         // siblings legitimately follow the physicals (e.g. 0,2,4,6,1,3,... on a
-        // 4-core box). What must always hold is that no cpu is handed out twice --
-        // two mining threads sharing one logical cpu is the failure that matters.
+        // 4-core box).
         try std.testing.expectEqual(@as(u7, 0), map[0]);
+
+        // Nor is uniqueness across all 10, which this test used to assert. It
+        // only holds while there are distinct cpus left to hand out, and the
+        // usable count is discovered rather than fixed: a 4-vCPU runner asked
+        // for 10 threads MUST repeat, because `recommendedAffinityForThreads`
+        // wraps the order deliberately. That assertion tested the runner, not
+        // the miner -- it began failing on Windows CI with this file
+        // byte-identical to its last green commit, when the hosted runner
+        // changed. Bound it by the machine instead.
+        affinity_once.call();
+        const distinct = @min(@as(usize, 10), affinity_len);
         var seen = [_]bool{false} ** MAX_AFFINITY;
-        for (0..10) |i| {
+        for (0..distinct) |i| {
             try std.testing.expect(!seen[map[i]]);
             seen[map[i]] = true;
+        }
+
+        // Past that point the contract is that surplus threads WRAP the order.
+        // The failure worth catching is the other one: collapsing to cpu 0 and
+        // stacking every surplus thread onto a single core.
+        for (distinct..10) |i| {
+            try std.testing.expectEqual(affinity_order[i % affinity_len], map[i]);
         }
     }
     // Beyond n should be zero on every OS
     try std.testing.expectEqual(@as(u7, 0), map[10]);
+
+    // Exercise the wrap on EVERY host, not just a small one. No machine has
+    // MAX_AFFINITY usable cpus, so this reaches the surplus-thread branch that
+    // a 24-cpu developer box would otherwise never execute -- which is exactly
+    // how the previous version of this test passed locally for months while
+    // being wrong.
+    if (builtin.os.tag == .windows or builtin.os.tag == .linux) {
+        affinity_once.call();
+        const full = recommendedAffinityForThreads(MAX_AFFINITY);
+        try std.testing.expect(affinity_len >= 1);
+        for (0..MAX_AFFINITY) |i| {
+            try std.testing.expectEqual(affinity_order[i % affinity_len], full[i]);
+        }
+    }
 }
