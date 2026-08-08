@@ -358,11 +358,45 @@ const Builder = struct {
     }
 
     /// Record a run of already-suffix-sorted positions sharing one 3-byte prefix.
-    inline fn appendRun(self: *Builder, positions: []const u32) void {
+    /// `positions` holds CHUNK ORIGINS, not live positions: the caller rebased
+    /// `order` once after the seed sort so it no longer has to sweep all `g`
+    /// entries on every one of the 255 `rel` steps. The live position is
+    /// `positions[k] + rel`, and adding it here is free -- it folds into the
+    /// vector store that was already happening.
+    inline fn appendRun(self: *Builder, positions: []const u32, rel: u32) void {
         const begin = self.arena_len;
-        @memcpy(self.sc.arena[begin .. begin + positions.len], positions);
+        const relv: @Vector(8, u32) = @splat(rel);
+        // Unconditional wide store rather than the length-driven `@memcpy` this
+        // replaced. MEASURED +3.7%/+3.9% at 22 threads over two independent
+        // 8-pair runs (16/16), and ~0% at 1 thread -- so screen it at the
+        // operating point or it looks like nothing. The mechanism is NOT
+        // established: call-overhead removal would show at 1 thread and does
+        // not, so something thread-scaled (contention on a shared out-of-line
+        // copy body, or a store-buffer effect under SMT) is the likelier cause.
+        // Do not repeat a mechanism claim here that has not been measured.
+        //
+        // Over-read of `positions` is bounded: it aliases `order`, which is
+        // [MAX_GROUP = 512]u32, and the caller's index satisfies i < g <=
+        // full_groups <= data_len>>8 <= 281, so i + 8 <= 289.
+        // Over-write of `arena` is bounded: begin <= n <= 68,874 and
+        // begin + 8 < SCRATCH = 72,064. The slack lanes carry no meaning --
+        // `arena_len` advances by exactly `positions.len`, so the next
+        // appendRun overwrites them, the same invariant materialize's own wide
+        // read already relies on.
+        // The first store is unconditional: 89.8% of runs are <= 8 positions, so
+        // the common case is exactly one store and no branch. Longer runs step
+        // 8 at a time; the last step may over-write, which the bound above
+        // covers. A single fixed 8-lane store is NOT sufficient -- 10.2% of runs
+        // exceed 8 positions and would be silently truncated.
+        const v: @Vector(8, u32) = positions.ptr[0..8].*;
+        self.sc.arena[begin..][0..8].* = v + relv;
+        var k: u32 = 8;
+        while (k < positions.len) : (k += 8) {
+            const vn: @Vector(8, u32) = positions.ptr[k..][0..8].*;
+            self.sc.arena[begin + k ..][0..8].* = vn + relv;
+        }
         self.arena_len = begin + @as(u32, @intCast(positions.len));
-        const key = keyBE(load24(self.data, positions[0]));
+        const key = keyBE(load24(self.data, positions[0] + rel));
         self.countKey(key);
         self.sc.runs[self.runs_len] = packRun(key, begin, @intCast(positions.len));
         self.runs_len += 1;
@@ -400,29 +434,43 @@ const Builder = struct {
         if (comptime INSTRUMENT) emit_seed_elems += g;
         std.sort.pdq(u32, order[0..g], self.ctx, SuffixCtx.less);
 
+        // Rebase to the chunk origin ONCE. From here `order[c]` holds
+        // base + (chunk << 8); the live position at offset `rel` is
+        // `order[c] + rel`, reached by biasing the DATA POINTER rather than by
+        // rewriting the array. That is what removes the old per-rel sweep
+        // (`while (c < g) order[c] -= 1`, run 255 times per group-run).
+        c = 0;
+        while (c < g) : (c += 1) order[c] -= 255;
+
         var rel: i32 = 255;
         while (rel >= 0) : (rel -= 1) {
+            const relu: u32 = @intCast(rel);
+            // Addresses identical to `data[order[i] + relu]`: one pointer bias
+            // instead of `g` per-element decrements.
+            const dr = self.data + relu;
             // Group the sorted order[] into maximal same-3-byte-prefix runs.
             var i: u32 = 0;
             while (i < g) {
-                const key = load24(self.data, order[i]);
+                const key = load24(dr, order[i]);
                 var j = i + 1;
-                while (j < g and load24(self.data, order[j]) == key) : (j += 1) {}
+                while (j < g and load24(dr, order[j]) == key) : (j += 1) {}
                 if (comptime INSTRUMENT) emit_key_loads += (j - i) + 1;
-                self.appendRun(order[i..j]);
+                self.appendRun(order[i..j], relu);
                 i = j;
             }
             if (rel > 0) {
                 // Prepend one byte to every suffix, then stable-insert by that
                 // new leading byte -- the tails (rel+1 order) are already sorted.
-                c = 0;
-                while (c < g) : (c += 1) order[c] -= 1;
+                // The new leading byte of order[x] at offset rel-1 is
+                // data[order[x] + rel - 1]; read through a biased pointer so no
+                // element of `order` is rewritten to advance the offset.
+                const dn = self.data + (relu - 1);
                 var ii: u32 = 1;
                 while (ii < g) : (ii += 1) {
                     const pos = order[ii];
-                    const k = self.data[pos];
+                    const k = dn[pos];
                     var m = ii;
-                    while (m > 0 and self.data[order[m - 1]] > k) : (m -= 1) {
+                    while (m > 0 and dn[order[m - 1]] > k) : (m -= 1) {
                         order[m] = order[m - 1];
                         if (comptime INSTRUMENT) emit_shifts += 1;
                     }
